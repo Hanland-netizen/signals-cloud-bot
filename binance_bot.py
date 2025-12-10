@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import sys
 import time
 import logging
 import threading
 import requests
+import psycopg2
 from datetime import datetime, date, UTC, timedelta, timezone
 from typing import List, Dict, Optional
 
@@ -49,28 +47,23 @@ CONFIG = {
     "SYMBOL_COOLDOWN_SECONDS": 1800,
     "BTC_SYMBOL": "BTCUSDT",
     "BTC_FILTER_ENABLED": True,
-    "FOMC_DATES_UTC": [
-        # "2025-01-29 19:00",
-    ],
+    "FOMC_DATES_UTC": [],
     "FOMC_BLOCK_BEFORE": 3600,
     "FOMC_BLOCK_AFTER": 3600,
     "RISK_OFF_DEFAULT_SECONDS": 3 * 3600,
     "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
     "TG_CHAT_ID": os.getenv("TG_CHAT_ID", ""),
+    "DATABASE_URL": os.getenv("DATABASE_URL", ""),
 }
 
-SUBSCRIBERS_FILE = "subscribers.txt"
 SUBSCRIBERS = set()
-
 LAST_UPDATE_ID: Optional[int] = None
 STOP_EVENT = threading.Event()
 STATE = None
-
 SIGNALS_LOG_FILE = "signals_log.csv"
 
 logger = logging.getLogger("binance_signals_bot")
 logger.setLevel(logging.INFO)
-
 if not logger.handlers:
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
@@ -127,94 +120,101 @@ class BotState:
     def activate_risk_off(self, seconds: int):
         now_utc = datetime.now(timezone.utc)
         self.risk_off_until = now_utc + timedelta(seconds=seconds)
-        logger.info(
-            f"Risk OFF активирован до {self.risk_off_until.isoformat()} (UTC)."
-        )
+        logger.info(f"Risk OFF активирован до {self.risk_off_until.isoformat()} (UTC).")
 
     def deactivate_risk_off(self):
         self.risk_off_until = None
         logger.info("Risk OFF режим отключён вручную.")
 
 
-def load_subscribers():
-    global SUBSCRIBERS
-    if os.path.exists(SUBSCRIBERS_FILE):
-        try:
-            with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-                SUBSCRIBERS = {
-                    line.strip()
-                    for line in lines
-                    if line.strip() and all(ch.isdigit() or ch == "-" for ch in line.strip())
-                }
-            logger.info(f"Загружено подписчиков: {len(SUBSCRIBERS)}")
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке подписчиков: {e}")
-            SUBSCRIBERS = set()
-    else:
-        logger.info("Файл подписчиков не найден, начинаем с пустого списка.")
-        SUBSCRIBERS = set()
-
-
-def save_subscribers():
+def db_execute(query: str, params: Optional[tuple] = None, fetch: bool = False):
+    if not CONFIG["DATABASE_URL"]:
+        logger.error("DATABASE_URL не настроен.")
+        sys.exit(1)
+    conn = psycopg2.connect(CONFIG["DATABASE_URL"])
     try:
-        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
-            for cid in SUBSCRIBERS:
-                f.write(str(cid) + "\n")
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении подписчиков: {e}")
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params or ())
+                if fetch:
+                    return cur.fetchall()
+    finally:
+        conn.close()
+    return None
 
 
-def add_subscriber(chat_id: str):
+def db_init_and_load_subscribers():
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscribers (
+            chat_id BIGINT PRIMARY KEY,
+            is_admin BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """
+    )
+    rows = db_execute("SELECT chat_id FROM subscribers;", fetch=True) or []
+    SUBSCRIBERS.clear()
+    for (cid,) in rows:
+        SUBSCRIBERS.add(str(cid))
+    logger.info(f"Загружено подписчиков из БД: {len(SUBSCRIBERS)}")
+
+
+def db_add_subscriber(chat_id: str, is_admin: bool = False):
+    cid = int(chat_id)
+    db_execute(
+        """
+        INSERT INTO subscribers (chat_id, is_admin)
+        VALUES (%s, %s)
+        ON CONFLICT (chat_id) DO UPDATE SET is_admin = EXCLUDED.is_admin;
+        """,
+        (cid, is_admin),
+    )
     SUBSCRIBERS.add(str(chat_id))
-    save_subscribers()
-    logger.info(f"Добавлен подписчик: {chat_id}")
+    logger.info(f"Добавлен подписчик в БД: {chat_id} (admin={is_admin})")
 
 
-def remove_subscriber(chat_id: str):
+def db_remove_subscriber(chat_id: str):
+    cid = int(chat_id)
+    db_execute("DELETE FROM subscribers WHERE chat_id = %s;", (cid,))
     if str(chat_id) in SUBSCRIBERS:
         SUBSCRIBERS.remove(str(chat_id))
-        save_subscribers()
-        logger.info(f"Удалён подписчик: {chat_id}")
+    logger.info(f"Удалён подписчик из БД: {chat_id}")
+
+
+def db_get_subscribers_count() -> int:
+    rows = db_execute("SELECT COUNT(*) FROM subscribers;", fetch=True)
+    if not rows:
+        return 0
+    return int(rows[0][0])
 
 
 def is_fomc_block_active(now_utc: Optional[datetime] = None) -> bool:
     if not CONFIG["FOMC_DATES_UTC"]:
         return False
-
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
-
     before = CONFIG["FOMC_BLOCK_BEFORE"]
     after = CONFIG["FOMC_BLOCK_AFTER"]
-
     for dt_str in CONFIG["FOMC_DATES_UTC"]:
         try:
             fomc_time = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
             fomc_time = fomc_time.replace(tzinfo=timezone.utc)
         except Exception:
             continue
-
         block_start = fomc_time - timedelta(seconds=before)
         block_end = fomc_time + timedelta(seconds=after)
-
         if block_start <= now_utc <= block_end:
             logger.info(
                 f"Активно окно FOMC для {dt_str} (UTC). "
                 f"Сканирование рынка временно отключено."
             )
             return True
-
     return False
 
 
-def binance_request(
-    endpoint: str,
-    params: Optional[Dict] = None,
-    max_retries: int = 5
-) -> Optional[Dict]:
+def binance_request(endpoint: str, params: Optional[Dict] = None, max_retries: int = 5) -> Optional[Dict]:
     url = f"{CONFIG['BASE_URL']}{endpoint}"
-
     for attempt in range(1, max_retries + 1):
         if STOP_EVENT.is_set():
             return None
@@ -239,11 +239,9 @@ def binance_request(
 
 def get_trading_symbols() -> List[str]:
     logger.info("Загружаем список торгуемых USDT-M PERPETUAL символов...")
-
     exchange_info = binance_request("/fapi/v1/exchangeInfo")
     if not exchange_info:
         return []
-
     symbols_info = exchange_info.get("symbols", [])
     futures_symbols = [
         s["symbol"]
@@ -252,26 +250,21 @@ def get_trading_symbols() -> List[str]:
         and s.get("quoteAsset") == CONFIG["QUOTE_ASSET"]
         and s.get("status") == "TRADING"
     ]
-
     if not futures_symbols:
         logger.warning("Не найдено подходящих USDT-M PERPETUAL символов.")
         return []
-
     ticker_24h = binance_request("/fapi/v1/ticker/24hr")
     if not ticker_24h:
         return futures_symbols
-
     volume_dict = {
         item["symbol"]: float(item.get("quoteVolume", 0.0))
         for item in ticker_24h
     }
-
     filtered_symbols = [
         symbol
         for symbol in futures_symbols
         if volume_dict.get(symbol, 0.0) >= CONFIG["MIN_QUOTE_VOLUME"]
     ]
-
     logger.info(f"Найдено {len(futures_symbols)} USDT-M PERPETUAL символов")
     logger.info(
         f"После фильтрации по объёму (>= {CONFIG['MIN_QUOTE_VOLUME']:,} USDT): "
@@ -304,20 +297,16 @@ def rsi(values: List[float], period: int) -> List[float]:
     deltas = [values[i] - values[i - 1] for i in range(1, len(values))]
     gains = [max(d, 0) for d in deltas]
     losses = [abs(min(d, 0)) for d in deltas]
-
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-
     rsi_values: List[float] = []
     for i in range(period, len(deltas)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
         if avg_loss == 0:
             rs = float("inf")
         else:
             rs = avg_gain / avg_loss
-
         rsi_values.append(100 - (100 / (1 + rs)))
     return rsi_values
 
@@ -348,19 +337,15 @@ def get_btc_context() -> Optional[Dict]:
     if not klines:
         logger.warning("Не удалось загрузить свечи для BTC, фильтр по BTC отключен.")
         return None
-
     closes = [float(k[4]) for k in klines]
     ema_values = ema(closes, CONFIG["EMA_PERIOD"])
     rsi_values = rsi(closes, CONFIG["RSI_PERIOD"])
-
     if not ema_values or not rsi_values:
         logger.warning("Недостаточно данных для EMA/RSI BTC, фильтр по BTC отключен.")
         return None
-
     btc_price = closes[-1]
     btc_ema = ema_values[-1]
     btc_rsi = rsi_values[-1]
-
     ticker_24h = binance_request("/fapi/v1/ticker/24hr", params={"symbol": symbol})
     change_pct = 0.0
     if isinstance(ticker_24h, dict):
@@ -368,14 +353,12 @@ def get_btc_context() -> Optional[Dict]:
             change_pct = float(ticker_24h.get("priceChangePercent", 0.0))
         except (ValueError, TypeError):
             change_pct = 0.0
-
     ctx = {
         "price": btc_price,
         "ema200": btc_ema,
         "rsi": btc_rsi,
         "change24": change_pct,
     }
-
     logger.info(
         f"BTC контекст: цена={btc_price:.2f}, EMA200={btc_ema:.2f}, "
         f"RSI={btc_rsi:.1f}, 24h изменение={change_pct:.2f}%"
@@ -392,16 +375,13 @@ def find_impulse_candle(
 ) -> Optional[int]:
     if len(closes) <= lookback + 1:
         return None
-
     bodies = [abs(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
     avg_body = sum(bodies[:-lookback]) / max(len(bodies[:-lookback]), 1)
     avg_volume = sum(volumes[:-lookback]) / max(len(volumes[:-lookback]), 1)
-
     body_mult = CONFIG["BODY_MULTIPLIER"]
     vol_mult = CONFIG["VOLUME_MULTIPLIER"]
     min_body_to_range = CONFIG["MIN_BODY_TO_RANGE"]
     break_lookback = CONFIG["IMPULSE_BREAK_LOOKBACK"]
-
     for idx in range(len(closes) - lookback, len(closes)):
         body = abs(closes[idx] - closes[idx - 1])
         vol = volumes[idx]
@@ -409,30 +389,24 @@ def find_impulse_candle(
         low = lows[idx]
         candle_range = max(high - low, 1e-9)
         body_to_range = body / candle_range
-
         if body < body_mult * avg_body:
             continue
         if vol < vol_mult * avg_volume:
             continue
         if body_to_range < min_body_to_range:
             continue
-
         start = max(0, idx - break_lookback)
         prev_high = max(highs[start:idx]) if idx > start else highs[idx]
         prev_low = min(lows[start:idx]) if idx > start else lows[idx]
-
         is_bullish = closes[idx] > closes[idx - 1]
         is_bearish = closes[idx] < closes[idx - 1]
-
         if is_bullish:
             if high <= prev_high:
                 continue
         if is_bearish:
             if low >= prev_low:
                 continue
-
         return idx
-
     return None
 
 
@@ -447,18 +421,14 @@ def check_htf_trend(symbol: str, direction: str) -> bool:
     klines = get_klines(symbol, CONFIG["HTF_TIMEFRAME"], CONFIG["CANDLES_LIMIT"])
     if not klines:
         return True
-
     closes = [float(k[4]) for k in klines]
     ema_values = ema(closes, CONFIG["HTF_EMA_PERIOD"])
     rsi_values = rsi(closes, CONFIG["HTF_RSI_PERIOD"])
-
     if not ema_values or not rsi_values:
         return True
-
     price = closes[-1]
     ema_val = ema_values[-1]
     rsi_val = rsi_values[-1]
-
     if direction == "long":
         if price < ema_val:
             return False
@@ -482,13 +452,10 @@ def level_filter(
 ):
     lookback = CONFIG["LEVEL_LOOKBACK"]
     portion = CONFIG["LEVEL_MAX_TAKE_PORTION"]
-
     if len(highs) < lookback or len(lows) < lookback:
         return True
-
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
-
     if direction == "long":
         if entry < recent_high < take:
             dist_to_level = recent_high - entry
@@ -509,7 +476,6 @@ def level_filter(
                     f"(до уровня {dist_to_level:.5f}, до тейка {dist_to_take:.5f})."
                 )
                 return False
-
     return True
 
 
@@ -517,25 +483,20 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
     klines = get_klines(symbol, CONFIG["TIMEFRAME"], CONFIG["CANDLES_LIMIT"])
     if not klines:
         return None
-
     timestamps = [int(k[0]) for k in klines]
-    opens = [float(k[1]) for k in klines]
     highs = [float(k[2]) for k in klines]
     lows = [float(k[3]) for k in klines]
     closes = [float(k[4]) for k in klines]
     volumes = [float(k[5]) for k in klines]
-
     ema_values = ema(closes, CONFIG["EMA_PERIOD"])
     if not ema_values:
         return None
     current_ema = ema_values[-1]
     current_price = closes[-1]
-
     rsi_values = rsi(closes, CONFIG["RSI_PERIOD"])
     if not rsi_values:
         return None
     current_rsi = rsi_values[-1]
-
     atr_val = atr(highs, lows, closes, CONFIG["ATR_PERIOD"])
     if atr_val is not None:
         atr_pct = atr_val / current_price * 100
@@ -547,22 +508,18 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             return None
     else:
         atr_pct = None
-
     impulse_idx = find_impulse_candle(
         closes, volumes, highs, lows, CONFIG["LOOKBACK_CANDLES"]
     )
     if impulse_idx is None:
         return None
-
     is_bullish = closes[impulse_idx] > closes[impulse_idx - 1]
     is_bearish = closes[impulse_idx] < closes[impulse_idx - 1]
-
     if is_bearish:
         if current_price <= current_ema:
             return None
         if current_rsi >= CONFIG["RSI_OVERBOUGHT"]:
             return None
-
         if CONFIG["BTC_FILTER_ENABLED"] and btc_ctx is not None:
             btc_price = btc_ctx["price"]
             btc_ema = btc_ctx["ema200"]
@@ -571,28 +528,22 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
                 return None
             if btc_rsi > 70:
                 return None
-
         if not check_htf_trend(symbol, "long"):
             return None
-
         stop = lows[impulse_idx]
         entry = current_price
         risk = entry - stop
         if risk <= 0:
             return None
-
         risk_pct = (risk / entry) * 100
         if risk_pct < CONFIG["MIN_RISK_PCT"]:
             logger.info(
                 f"Сигнал {symbol} long отклонён: слишком маленький стоп ({risk_pct:.2f}%)"
             )
             return None
-
         take = entry + CONFIG["RISK_REWARD"] * risk
-
         if not level_filter(symbol, "long", entry, take, highs, lows):
             return None
-
         signal = {
             "symbol": symbol,
             "direction": "long",
@@ -608,13 +559,11 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             "atr_pct": atr_pct,
         }
         return signal
-
     if is_bullish:
         if current_price >= current_ema:
             return None
         if current_rsi <= CONFIG["RSI_OVERSOLD"]:
             return None
-
         if CONFIG["BTC_FILTER_ENABLED"] and btc_ctx is not None:
             btc_price = btc_ctx["price"]
             btc_ema = btc_ctx["ema200"]
@@ -623,28 +572,22 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
                 return None
             if btc_rsi < 30:
                 return None
-
         if not check_htf_trend(symbol, "short"):
             return None
-
         stop = highs[impulse_idx]
         entry = current_price
         risk = stop - entry
         if risk <= 0:
             return None
-
         risk_pct = (risk / entry) * 100
         if risk_pct < CONFIG["MIN_RISK_PCT"]:
             logger.info(
                 f"Сигнал {symbol} short отклонён: слишком маленький стоп ({risk_pct:.2f}%)"
             )
             return None
-
         take = entry - CONFIG["RISK_REWARD"] * risk
-
         if not level_filter(symbol, "short", entry, take, highs, lows):
             return None
-
         signal = {
             "symbol": symbol,
             "direction": "short",
@@ -660,7 +603,6 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             "atr_pct": atr_pct,
         }
         return signal
-
     return None
 
 
@@ -675,19 +617,16 @@ def send_telegram_message(
     if not token:
         logger.warning("Telegram token не настроен")
         return False
-
     target_chat = chat_id or default_chat
     if not target_chat:
         logger.warning("Telegram chat_id не настроен")
         return False
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload: Dict[str, object] = {"chat_id": target_chat, "text": message}
     if html:
         payload["parse_mode"] = "HTML"
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-
     try:
         resp = requests.post(url, json=payload, timeout=20)
         if resp.status_code != 200:
@@ -706,7 +645,6 @@ def broadcast_to_subscribers(message: str, html: bool = False) -> int:
     if not SUBSCRIBERS:
         logger.info("Нет подписчиков, сигнал не разсылаем.")
         return 0
-
     sent = 0
     for cid in list(SUBSCRIBERS):
         if send_telegram_message(message, chat_id=cid, html=html):
@@ -722,7 +660,6 @@ def format_signal_message(signal: Dict) -> str:
     atr_str = ""
     if signal.get("atr_pct") is not None:
         atr_str = f"\nATR: {signal['atr_pct']:.2f}%"
-
     msg = (
         f"🎯 {signal['symbol']} {direction_emoji}\n"
         f"Плечо {lev}х\n"
@@ -774,9 +711,8 @@ def handle_command(message: Dict):
     chat_id = str(chat.get("id"))
     text = message.get("text", "") or ""
     cmd = text.strip().split()[0]
-
     if cmd == "/start":
-        add_subscriber(chat_id)
+        db_add_subscriber(chat_id, is_admin=False)
         welcome = (
             "<b>👋 Привет!</b>\n\n"
             "Вы подписались на сигналы Binance Futures (USDT-M).\n"
@@ -790,16 +726,15 @@ def handle_command(message: Dict):
             "/help — справка\n"
         )
         send_telegram_message(welcome, chat_id=chat_id, html=True)
-
     elif cmd == "/stop":
-        remove_subscriber(chat_id)
+        db_remove_subscriber(chat_id)
         msg = (
             "❌ Вы отписались от сигналов.\n"
             "Введите /start, если захотите снова подписаться."
         )
         send_telegram_message(msg, chat_id=chat_id, html=False)
-
     elif cmd == "/status":
+        subs_count = db_get_subscribers_count()
         lines = []
         lines.append("<b>📊 Статус бота</b>\n")
         lines.append(f"Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек.")
@@ -807,7 +742,7 @@ def handle_command(message: Dict):
         lines.append(
             f"Максимум сигналов за один скан: {CONFIG['MAX_SIGNALS_PER_SCAN']}."
         )
-        lines.append(f"Подписчиков: {len(SUBSCRIBERS)}.")
+        lines.append(f"Подписчиков: {subs_count}.")
         lines.append(
             f"Фильтр BTC: {'включен' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}."
         )
@@ -821,7 +756,6 @@ def handle_command(message: Dict):
             lines.append("FOMC-окна: настроены (сканирование блокируется ±1 час).")
         else:
             lines.append("FOMC-окна: не настроены (список дат пуст).")
-
         if STATE and STATE.is_risk_off():
             until = STATE.risk_off_until
             lines.append(
@@ -829,10 +763,8 @@ def handle_command(message: Dict):
             )
         else:
             lines.append("Risk OFF: выключен.")
-
         msg = "\n".join(lines)
         send_telegram_message(msg, chat_id=chat_id, html=True)
-
     elif cmd == "/help":
         help_msg = (
             "<b>ℹ️ Справка</b>\n\n"
@@ -852,7 +784,6 @@ def handle_command(message: Dict):
             "• /risk_on — повторное включение сигналов\n"
         )
         send_telegram_message(help_msg, chat_id=chat_id, html=True)
-
     elif cmd == "/risk_off":
         if STATE:
             STATE.activate_risk_off(CONFIG["RISK_OFF_DEFAULT_SECONDS"])
@@ -862,7 +793,6 @@ def handle_command(message: Dict):
                 "Сигналы временно отключены. Для включения используйте /risk_on."
             )
             send_telegram_message(msg, chat_id=chat_id, html=False)
-
     elif cmd == "/risk_on":
         if STATE:
             STATE.deactivate_risk_off()
@@ -876,16 +806,13 @@ def telegram_polling():
     if not token:
         logger.warning("Telegram token не настроен, polling отключён.")
         return
-
     logger.info("Запуск Telegram bot polling...")
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     timeout = 30
-
     while not STOP_EVENT.is_set():
         params: Dict[str, object] = {"timeout": timeout}
         if LAST_UPDATE_ID is not None:
             params["offset"] = LAST_UPDATE_ID + 1
-
         try:
             resp = requests.get(url, params=params, timeout=timeout + 5)
             resp.raise_for_status()
@@ -894,7 +821,6 @@ def telegram_polling():
             logger.error(f"Ошибка получения обновлений: {e}")
             time.sleep(5)
             continue
-
         results = data.get("result", [])
         for update in results:
             LAST_UPDATE_ID = update.get("update_id", LAST_UPDATE_ID)
@@ -908,27 +834,20 @@ def telegram_polling():
 
 def scan_market(state: BotState):
     state.reset_daily_if_needed()
-
     if state.is_risk_off():
         logger.info("Risk OFF режим активен, сканирование пропущено.")
         return
-
     if is_fomc_block_active():
         return
-
     if not state.can_send_signal():
         logger.info("Дневной лимит сигналов достигнут, сканирование пропущено.")
         return
-
     btc_ctx = get_btc_context()
     symbols = get_trading_symbols()
     if not symbols:
         return
-
     logger.info(f"Анализ {len(symbols)} символов...")
-
     signals_found: List[Dict] = []
-
     for symbol in symbols:
         if STOP_EVENT.is_set():
             return
@@ -936,42 +855,33 @@ def scan_market(state: BotState):
             signal = analyze_symbol(symbol, btc_ctx)
             if signal is None:
                 continue
-
             symbol_name = signal["symbol"]
             if not state.is_symbol_cooled_down(symbol_name):
                 logger.info(
                     f"Сигнал по {symbol_name} отклонён: cooldown по символу ещё не вышел."
                 )
                 continue
-
             signal_id = f"{signal['symbol']}_{signal['direction']}_{signal['impulse_time']}"
             if signal_id in state.sent_signal_ids:
                 continue
-
             signals_found.append(signal)
             logger.info(f"Найден сигнал: {signal['symbol']} {signal['direction']}")
         except Exception as e:
             logger.error(f"Ошибка анализа символа {symbol}: {e}", exc_info=True)
             continue
-
     if not signals_found:
         logger.info("Подходящих сигналов не найдено.")
         return
-
     signals_found.sort(key=lambda s: s["risk_pct"])
-
     signals_sent_this_scan = 0
     max_per_scan = CONFIG["MAX_SIGNALS_PER_SCAN"]
-
     for signal in signals_found:
         if not state.can_send_signal():
             logger.info("Достигнут дневной лимит сигналов, прекращаем отправку.")
             break
-
         if signals_sent_this_scan >= max_per_scan:
             logger.info("Достигнут лимит сигналов за этот скан, останавливаем отправку.")
             break
-
         msg = format_signal_message(signal)
         sent_count = broadcast_to_subscribers(msg, html=False)
         if sent_count > 0:
@@ -983,9 +893,7 @@ def scan_market(state: BotState):
                 f"Сигнал {signal['symbol']} {signal['direction']} отправлен "
                 f"{sent_count} подписчикам."
             )
-
         time.sleep(1)
-
     logger.info(
         f"Сканирование завершено. Отправлено сигналов: "
         f"{signals_sent_this_scan}, всего за день: "
@@ -1013,39 +921,39 @@ def main():
         logger.info("  - FOMC-окна: настроены (±1 час вокруг решения).")
     else:
         logger.info("  - FOMC-окна: не настроены (список дат пуст).")
-
     tg_token = CONFIG["TG_BOT_TOKEN"]
     tg_chat = CONFIG["TG_CHAT_ID"]
     if not tg_token:
         logger.error("TG_BOT_TOKEN не настроен. Выход.")
         return
-
-    load_subscribers()
-
+    if not CONFIG["DATABASE_URL"]:
+        logger.error("DATABASE_URL не настроен. Выход.")
+        return
+    db_init_and_load_subscribers()
+    if tg_chat:
+        db_add_subscriber(tg_chat, is_admin=True)
+    subs_count = db_get_subscribers_count()
+    logger.info(f"Подписчиков в БД после инициализации: {subs_count}")
     if tg_chat:
         welcome_msg = (
             "<b>🚀 Бот запущен!</b>\n\n"
             "Я сканирую Binance Futures (USDT-M), основной анализ на 5m, "
             "тренд подтверждается на 15m, учитываю BTC, ATR и базовые уровни.\n\n"
-            f"Первый скан будет через {CONFIG['SCAN_INTERVAL_SECONDS']} секунд."
+            f"Первый скан будет через {CONFIG['SCAN_INTERVAL_SECONDS']} секунд.\n"
+            f"Текущее количество подписчиков: {subs_count}."
         )
         send_telegram_message(welcome_msg, chat_id=tg_chat, html=True)
-
     polling_thread = threading.Thread(target=telegram_polling, daemon=True)
     polling_thread.start()
-
     STATE = BotState()
-
     logger.info("Ожидание перед первым сканированием...")
     time.sleep(CONFIG["SCAN_INTERVAL_SECONDS"])
-
     try:
         while not STOP_EVENT.is_set():
             try:
                 scan_market(STATE)
             except Exception as e:
                 logger.error(f"Ошибка в цикле сканирования: {e}", exc_info=True)
-
             logger.info(
                 f"Ожидание {CONFIG['SCAN_INTERVAL_SECONDS']} секунд до следующего сканирования..."
             )
