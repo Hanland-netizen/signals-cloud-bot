@@ -32,6 +32,8 @@ CONFIG = {
     "RSI_OVERBOUGHT": 70,
     "RSI_OVERSOLD": 30,
     "MIN_RISK_PCT": 0.35,
+    "MIN_TP_PCT": 0.7,
+    "STOP_ATR_MULTIPLIER": 0.2,
     "LEVEL_LOOKBACK": 30,
     "LEVEL_MAX_TAKE_PORTION": 0.6,
     "LEVERAGE_RULES": [
@@ -41,6 +43,12 @@ CONFIG = {
         (5.0, 7),
         (float("inf"), 5),
     ],
+    "MACD_FAST": 12,
+    "MACD_SLOW": 26,
+    "MACD_SIGNAL": 9,
+    "STOCH_RSI_PERIOD": 14,
+    "STOCH_RSI_K_MIN": 10,
+    "STOCH_RSI_K_MAX": 90,
     "MAX_SIGNALS_PER_DAY": 7,
     "SCAN_INTERVAL_SECONDS": 600,
     "MAX_SIGNALS_PER_SCAN": 1,
@@ -56,7 +64,7 @@ CONFIG = {
     "DATABASE_URL": os.getenv("DATABASE_URL", ""),
 }
 
-SUBSCRIBERS = set()
+SUBSCRIBERS: set[str] = set()
 LAST_UPDATE_ID: Optional[int] = None
 STOP_EVENT = threading.Event()
 STATE = None
@@ -76,7 +84,7 @@ class BotState:
     def __init__(self):
         self.signals_sent_today = 0
         self.last_reset_date: date = datetime.now().date()
-        self.sent_signal_ids = set()
+        self.sent_signal_ids: set[str] = set()
         self.risk_off_until: Optional[datetime] = None
         self.last_signal_time_by_symbol: Dict[str, datetime] = {}
 
@@ -331,6 +339,41 @@ def atr(highs: List[float], lows: List[float], closes: List[float], period: int)
     return sum(trs[-period:]) / period
 
 
+def latest_macd(values: List[float]) -> Optional[Dict[str, float]]:
+    fast = CONFIG["MACD_FAST"]
+    slow = CONFIG["MACD_SLOW"]
+    signal_p = CONFIG["MACD_SIGNAL"]
+    if len(values) < slow + signal_p + 5:
+        return None
+    ema_fast = ema(values, fast)
+    ema_slow = ema(values, slow)
+    if not ema_fast or not ema_slow:
+        return None
+    min_len = min(len(ema_fast), len(ema_slow))
+    macd_line = [ema_fast[-min_len + i] - ema_slow[-min_len + i] for i in range(min_len)]
+    signal_line = ema(macd_line, signal_p)
+    if not signal_line:
+        return None
+    macd_val = macd_line[-1]
+    signal_val = signal_line[-1]
+    hist_val = macd_val - signal_val
+    return {"macd": macd_val, "signal": signal_val, "hist": hist_val}
+
+
+def latest_stoch_rsi_from_rsi(rsi_values: List[float]) -> Optional[float]:
+    period = CONFIG["STOCH_RSI_PERIOD"]
+    if len(rsi_values) < period:
+        return None
+    window = rsi_values[-period:]
+    rsi_min = min(window)
+    rsi_max = max(window)
+    if rsi_max == rsi_min:
+        return None
+    last_rsi = window[-1]
+    k = (last_rsi - rsi_min) / (rsi_max - rsi_min) * 100
+    return k
+
+
 def get_btc_context() -> Optional[Dict]:
     symbol = CONFIG["BTC_SYMBOL"]
     klines = get_klines(symbol, CONFIG["TIMEFRAME"], CONFIG["CANDLES_LIMIT"])
@@ -343,6 +386,8 @@ def get_btc_context() -> Optional[Dict]:
     if not ema_values or not rsi_values:
         logger.warning("Недостаточно данных для EMA/RSI BTC, фильтр по BTC отключен.")
         return None
+    macd_ctx = latest_macd(closes)
+    stoch_ctx = latest_stoch_rsi_from_rsi(rsi_values)
     btc_price = closes[-1]
     btc_ema = ema_values[-1]
     btc_rsi = rsi_values[-1]
@@ -359,6 +404,12 @@ def get_btc_context() -> Optional[Dict]:
         "rsi": btc_rsi,
         "change24": change_pct,
     }
+    if macd_ctx is not None:
+        ctx["macd"] = macd_ctx["macd"]
+        ctx["macd_signal"] = macd_ctx["signal"]
+        ctx["macd_hist"] = macd_ctx["hist"]
+    if stoch_ctx is not None:
+        ctx["stoch_rsi_k"] = stoch_ctx
     logger.info(
         f"BTC контекст: цена={btc_price:.2f}, EMA200={btc_ema:.2f}, "
         f"RSI={btc_rsi:.1f}, 24h изменение={change_pct:.2f}%"
@@ -497,6 +548,10 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
     if not rsi_values:
         return None
     current_rsi = rsi_values[-1]
+    stoch_k = latest_stoch_rsi_from_rsi(rsi_values)
+    macd_vals = latest_macd(closes)
+    if macd_vals is None or stoch_k is None:
+        return None
     atr_val = atr(highs, lows, closes, CONFIG["ATR_PERIOD"])
     if atr_val is not None:
         atr_pct = atr_val / current_price * 100
@@ -508,6 +563,7 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             return None
     else:
         atr_pct = None
+    stop_buffer = CONFIG["STOP_ATR_MULTIPLIER"] * atr_val if atr_val is not None else 0.0
     impulse_idx = find_impulse_candle(
         closes, volumes, highs, lows, CONFIG["LOOKBACK_CANDLES"]
     )
@@ -515,10 +571,16 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
         return None
     is_bullish = closes[impulse_idx] > closes[impulse_idx - 1]
     is_bearish = closes[impulse_idx] < closes[impulse_idx - 1]
+    stoch_min = CONFIG["STOCH_RSI_K_MIN"]
+    stoch_max = CONFIG["STOCH_RSI_K_MAX"]
     if is_bearish:
         if current_price <= current_ema:
             return None
         if current_rsi >= CONFIG["RSI_OVERBOUGHT"]:
+            return None
+        if not (stoch_min < stoch_k < stoch_max):
+            return None
+        if not (macd_vals["macd"] > macd_vals["signal"] and macd_vals["hist"] >= 0):
             return None
         if CONFIG["BTC_FILTER_ENABLED"] and btc_ctx is not None:
             btc_price = btc_ctx["price"]
@@ -530,7 +592,7 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
                 return None
         if not check_htf_trend(symbol, "long"):
             return None
-        stop = lows[impulse_idx]
+        stop = lows[impulse_idx] - stop_buffer
         entry = current_price
         risk = entry - stop
         if risk <= 0:
@@ -542,6 +604,12 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             )
             return None
         take = entry + CONFIG["RISK_REWARD"] * risk
+        tp_pct = abs(take - entry) / entry * 100
+        if tp_pct < CONFIG["MIN_TP_PCT"]:
+            logger.info(
+                f"Сигнал {symbol} long отклонён: слишком маленький потенциал тейка ({tp_pct:.2f}%)"
+            )
+            return None
         if not level_filter(symbol, "long", entry, take, highs, lows):
             return None
         signal = {
@@ -552,6 +620,10 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             "take": take,
             "ema200": current_ema,
             "rsi": current_rsi,
+            "stoch_rsi_k": stoch_k,
+            "macd": macd_vals["macd"],
+            "macd_signal": macd_vals["signal"],
+            "macd_hist": macd_vals["hist"],
             "impulse_time": datetime.fromtimestamp(
                 timestamps[impulse_idx] / 1000, UTC
             ).isoformat(),
@@ -564,6 +636,10 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             return None
         if current_rsi <= CONFIG["RSI_OVERSOLD"]:
             return None
+        if not (stoch_min < stoch_k < stoch_max):
+            return None
+        if not (macd_vals["macd"] < macd_vals["signal"] and macd_vals["hist"] <= 0):
+            return None
         if CONFIG["BTC_FILTER_ENABLED"] and btc_ctx is not None:
             btc_price = btc_ctx["price"]
             btc_ema = btc_ctx["ema200"]
@@ -574,7 +650,7 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
                 return None
         if not check_htf_trend(symbol, "short"):
             return None
-        stop = highs[impulse_idx]
+        stop = highs[impulse_idx] + stop_buffer
         entry = current_price
         risk = stop - entry
         if risk <= 0:
@@ -586,6 +662,12 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             )
             return None
         take = entry - CONFIG["RISK_REWARD"] * risk
+        tp_pct = abs(take - entry) / entry * 100
+        if tp_pct < CONFIG["MIN_TP_PCT"]:
+            logger.info(
+                f"Сигнал {symbol} short отклонён: слишком маленький потенциал тейка ({tp_pct:.2f}%)"
+            )
+            return None
         if not level_filter(symbol, "short", entry, take, highs, lows):
             return None
         signal = {
@@ -596,6 +678,10 @@ def analyze_symbol(symbol: str, btc_ctx: Optional[Dict]) -> Optional[Dict]:
             "take": take,
             "ema200": current_ema,
             "rsi": current_rsi,
+            "stoch_rsi_k": stoch_k,
+            "macd": macd_vals["macd"],
+            "macd_signal": macd_vals["signal"],
+            "macd_hist": macd_vals["hist"],
             "impulse_time": datetime.fromtimestamp(
                 timestamps[impulse_idx] / 1000, UTC
             ).isoformat(),
@@ -610,7 +696,7 @@ def send_telegram_message(
     message: str,
     chat_id: Optional[str] = None,
     html: bool = True,
-    reply_markup: Optional[Dict] = None
+    reply_markup: Optional[Dict] = None,
 ) -> bool:
     token = CONFIG["TG_BOT_TOKEN"]
     default_chat = CONFIG["TG_CHAT_ID"]
@@ -660,6 +746,12 @@ def format_signal_message(signal: Dict) -> str:
     atr_str = ""
     if signal.get("atr_pct") is not None:
         atr_str = f"\nATR: {signal['atr_pct']:.2f}%"
+    macd_str = ""
+    if signal.get("macd") is not None and signal.get("macd_signal") is not None:
+        macd_str = f"\nMACD: {signal['macd']:.5f}, signal: {signal['macd_signal']:.5f}"
+    stoch_str = ""
+    if signal.get("stoch_rsi_k") is not None:
+        stoch_str = f"\nStochRSI: {signal['stoch_rsi_k']:.1f}"
     msg = (
         f"🎯 {signal['symbol']} {direction_emoji}\n"
         f"Плечо {lev}х\n"
@@ -669,10 +761,13 @@ def format_signal_message(signal: Dict) -> str:
         f"Таймфрейм: {CONFIG['TIMEFRAME']} (MTF: {CONFIG['HTF_TIMEFRAME']})\n"
         f"EMA200: {signal['ema200']:.5f}\n"
         f"RSI({CONFIG['RSI_PERIOD']}): {signal['rsi']:.1f}"
-        f"{atr_str}\n"
+        f"{atr_str}"
+        f"{macd_str}"
+        f"{stoch_str}\n"
         f"Импульсная свеча (UTC): {signal['impulse_time']}\n\n"
-        f"Логика: импульс, стоп за экстремумом, тейк по RR {CONFIG['RISK_REWARD']}, "
-        f"фильтр по тренду, RSI, ATR, BTC и 15m-тренду."
+        f"Логика: импульс, стоп за экстремумом c буфером по ATR, "
+        f"тейк по RR {CONFIG['RISK_REWARD']}, фильтр по тренду, "
+        f"RSI, StochRSI, MACD, ATR, BTC и 15m-тренду."
     )
     return msg
 
@@ -684,7 +779,8 @@ def log_signal(signal: Dict):
             if header_needed:
                 f.write(
                     "timestamp_utc,symbol,direction,entry,stop,take,"
-                    "risk_pct,atr_pct,timeframe,htf_timeframe,source\n"
+                    "risk_pct,atr_pct,macd,macd_signal,macd_hist,stoch_rsi_k,"
+                    "timeframe,htf_timeframe,source\n"
                 )
             ts = datetime.now(timezone.utc).isoformat()
             line = (
@@ -696,108 +792,232 @@ def log_signal(signal: Dict):
                 f"{signal['take']:.8f},"
                 f"{signal['risk_pct']:.4f},"
                 f"{signal.get('atr_pct') if signal.get('atr_pct') is not None else ''},"
+                f"{signal.get('macd') if signal.get('macd') is not None else ''},"
+                f"{signal.get('macd_signal') if signal.get('macd_signal') is not None else ''},"
+                f"{signal.get('macd_hist') if signal.get('macd_hist') is not None else ''},"
+                f"{signal.get('stoch_rsi_k') if signal.get('stoch_rsi_k') is not None else ''},"
                 f"{CONFIG['TIMEFRAME']},"
                 f"{CONFIG['HTF_TIMEFRAME']},"
-                f"impulse_ema_rsi_btc_mtf\n"
+                f"impulse_ema_rsi_macd_stoch_btc_mtf\n"
             )
             f.write(line)
     except Exception as e:
         logger.error(f"Ошибка записи сигнала в лог: {e}")
 
 
+def is_admin_chat(chat_id: str) -> bool:
+    return CONFIG["TG_CHAT_ID"] and chat_id == CONFIG["TG_CHAT_ID"]
+
+
+def get_reply_keyboard(chat_id: str) -> Dict:
+    if is_admin_chat(chat_id):
+        rows = [
+            [{"text": "🚀 Старт"}, {"text": "📊 Статус"}],
+            [{"text": "ℹ️ Помощь"}, {"text": "📴 Стоп"}],
+            [{"text": "📈 Статистика"}, {"text": "👥 Подписчики"}],
+            [{"text": "⚙️ Настройки"}, {"text": "🛑 Risk OFF"}],
+            [{"text": "🟢 Risk ON"}],
+        ]
+    else:
+        rows = [
+            [{"text": "🚀 Старт"}, {"text": "📊 Статус"}],
+            [{"text": "ℹ️ Помощь"}, {"text": "📴 Стоп"}],
+        ]
+    return {"keyboard": rows, "resize_keyboard": True}
+
+
 def handle_command(message: Dict):
     global STATE
     chat = message.get("chat", {})
     chat_id = str(chat.get("id"))
-    text = message.get("text", "") or ""
-    cmd = text.strip().split()[0]
-    if cmd == "/start":
-        db_add_subscriber(chat_id, is_admin=False)
+    text = (message.get("text") or "").strip()
+    if not text:
+        return
+    kb = get_reply_keyboard(chat_id)
+    lower = text.lower()
+    first_token = text.split()[0]
+    is_admin = is_admin_chat(chat_id)
+    if first_token == "/start" or lower == "🚀 старт":
+        db_add_subscriber(chat_id, is_admin=is_admin)
+        subs_count = db_get_subscribers_count()
         welcome = (
-            "<b>👋 Привет!</b>\n\n"
-            "Вы подписались на сигналы Binance Futures (USDT-M).\n"
-            "Основной анализ ведётся на 5m, тренд подтверждается на 15m, "
-            "учитывается BTC, ATR и базовые уровни.\n\n"
-            "Команды:\n"
-            "/status — статус бота\n"
-            "/risk_off — временно выключить сигналы\n"
-            "/risk_on — снова включить сигналы\n"
-            "/stop — отписаться от сигналов\n"
-            "/help — справка\n"
+            "<b>🚀 Бот запущен!</b>\n\n"
+            "Вы подписались на торговые сигналы Binance Futures (USDT-M).\n\n"
+            "Я использую:\n"
+            "• импульсный анализ на 5m\n"
+            "• подтверждение тренда на 15m\n"
+            "• фильтр по EMA200, RSI, StochRSI, MACD\n"
+            "• контекст BTCUSDT и ATR-волатильность\n"
+            "• фильтрацию по уровням и ежедневный лимит сигналов\n\n"
+            "Основные команды:\n"
+            "• <b>🚀 Старт</b> — подписка или обновление клавиатуры\n"
+            "• <b>📊 Статус</b> — состояние бота\n"
+            "• <b>ℹ️ Помощь</b> — описание логики\n"
+            "• <b>📴 Стоп</b> — отписаться от сигналов\n"
         )
-        send_telegram_message(welcome, chat_id=chat_id, html=True)
-    elif cmd == "/stop":
+        send_telegram_message(welcome, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/stop" or lower == "📴 стоп":
         db_remove_subscriber(chat_id)
         msg = (
-            "❌ Вы отписались от сигналов.\n"
-            "Введите /start, если захотите снова подписаться."
+            "📴 Вы отписались от сигналов.\n"
+            "Если захотите вернуться — нажмите «🚀 Старт» или отправьте /start."
         )
-        send_telegram_message(msg, chat_id=chat_id, html=False)
-    elif cmd == "/status":
+        send_telegram_message(msg, chat_id=chat_id, html=False, reply_markup=kb)
+    elif first_token == "/status" or lower == "📊 статус":
         subs_count = db_get_subscribers_count()
-        lines = []
-        lines.append("<b>📊 Статус бота</b>\n")
-        lines.append(f"Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек.")
-        lines.append(f"Максимум сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}.")
-        lines.append(
-            f"Максимум сигналов за один скан: {CONFIG['MAX_SIGNALS_PER_SCAN']}."
-        )
-        lines.append(f"Подписчиков: {subs_count}.")
-        lines.append(
-            f"Фильтр BTC: {'включен' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}."
-        )
-        lines.append(
-            f"Multi-timeframe: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}."
-        )
-        lines.append(
-            f"ATR-фильтр: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%."
-        )
+        risk_off_state = "активен" if (STATE and STATE.is_risk_off()) else "выключен"
+        msg_lines = [
+            "<b>📊 Статус торгового бота</b>",
+            "",
+            f"⏱ Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек",
+            f"🎯 Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
+            f"📈 Multi-TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
+            f"💹 Фильтр BTC: {'включён' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}",
+            f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%",
+            f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
+            "",
+            f"👥 Подписчиков: {subs_count}",
+        ]
+        if is_admin and STATE:
+            msg_lines.append(
+                f"📌 Сигналы сегодня: "
+                f"{STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}"
+            )
+        msg_lines.append(f"🛑 Режим Risk OFF: {risk_off_state}")
         if CONFIG["FOMC_DATES_UTC"]:
-            lines.append("FOMC-окна: настроены (сканирование блокируется ±1 час).")
+            msg_lines.append("📅 FOMC-окна: настроены (бот не сканирует ±1 час).")
         else:
-            lines.append("FOMC-окна: не настроены (список дат пуст).")
-        if STATE and STATE.is_risk_off():
-            until = STATE.risk_off_until
-            lines.append(
-                f"Risk OFF: активен до {until.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}."
+            msg_lines.append("📅 FOMC-окна: не заданы (список дат пуст).")
+        msg = "\n".join(msg_lines)
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/help" or lower == "ℹ️ помощь":
+        help_msg = (
+            "<b>ℹ️ Что делает бот</b>\n\n"
+            "Бот автоматически:\n"
+            "• сканирует USDT-M фьючерсы Binance\n"
+            "• ищет импульсные свечи на 5m\n"
+            "• подтверждает тренд на 15m\n"
+            "• фильтрует по EMA200, RSI, StochRSI, MACD\n"
+            "• учитывает контекст BTCUSDT\n"
+            "• проверяет волатильность через ATR\n"
+            "• фильтрует сигналы по уровням и периодам\n"
+            "• ограничивает сигналы по дню и по инструменту\n\n"
+            "Сигналы не являются финансовой рекомендацией. "
+            "Торговля фьючерсами связана с повышенным риском."
+        )
+        send_telegram_message(help_msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/admin_subs" or lower == "👥 подписчики":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
+        subs_count = db_get_subscribers_count()
+        msg = f"👥 Текущих подписчиков в базе: <b>{subs_count}</b>."
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/admin_stats" or lower == "📈 статистика":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
+        if STATE:
+            msg = (
+                "<b>📈 Статистика за сегодня</b>\n\n"
+                f"Отправлено сигналов: {STATE.signals_sent_today}/"
+                f"{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
+                "Подробные сигналы записываются в файл signals_log.csv "
+                "на стороне сервера."
             )
         else:
-            lines.append("Risk OFF: выключен.")
-        msg = "\n".join(lines)
-        send_telegram_message(msg, chat_id=chat_id, html=True)
-    elif cmd == "/help":
-        help_msg = (
-            "<b>ℹ️ Справка</b>\n\n"
-            "Бот автоматически:\n"
-            "• Сканирует USDT-M фьючерсы Binance\n"
-            "• Ищет импульсные свечи на 5m\n"
-            "• Подтверждает тренд на 15m\n"
-            "• Фильтрует по EMA200 и RSI\n"
-            "• Учитывает контекст BTCUSDT\n"
-            "• Использует ATR-фильтр волатильности\n"
-            "• Проверяет базовые уровни до тейка\n"
-            "• Ограничивает сигналы по символу и в день\n"
-            "• Отправляет сигналы всем подписчикам (/start)\n\n"
-            "Дополнительно:\n"
-            "• FOMC-окна: бот не торгует за 1 час до и 1 час после решения ФРС\n"
-            "• /risk_off — ручной Risk OFF режим (на несколько часов)\n"
-            "• /risk_on — повторное включение сигналов\n"
-        )
-        send_telegram_message(help_msg, chat_id=chat_id, html=True)
-    elif cmd == "/risk_off":
+            msg = "Статистика временно недоступна."
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/settings" or lower.startswith("⚙️ настройки"):
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
+        parts = text.split()
+        if len(parts) == 1:
+            msg = (
+                "<b>⚙️ Текущие настройки</b>\n\n"
+                f"• MIN_QUOTE_VOLUME: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT\n"
+                f"• MAX_SIGNALS_PER_DAY: {CONFIG['MAX_SIGNALS_PER_DAY']}\n"
+                f"• SCAN_INTERVAL_SECONDS: {CONFIG['SCAN_INTERVAL_SECONDS']} сек\n\n"
+                "Чтобы изменить, используйте формат:\n"
+                "<code>/settings volume=70000000 max_signals=5 interval=900</code>"
+            )
+            send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+            return
+        changes = []
+        for token in parts[1:]:
+            if "=" not in token:
+                continue
+            key, val = token.split("=", 1)
+            key = key.strip().lower()
+            val = val.strip()
+            try:
+                ival = int(val)
+            except ValueError:
+                continue
+            if key in ("volume", "min_volume"):
+                CONFIG["MIN_QUOTE_VOLUME"] = ival
+                changes.append(f"MIN_QUOTE_VOLUME → {ival:,}")
+            elif key in ("max_signals", "max_per_day"):
+                CONFIG["MAX_SIGNALS_PER_DAY"] = ival
+                changes.append(f"MAX_SIGNALS_PER_DAY → {ival}")
+            elif key in ("interval", "scan_interval"):
+                CONFIG["SCAN_INTERVAL_SECONDS"] = ival
+                changes.append(f"SCAN_INTERVAL_SECONDS → {ival} сек")
+        if not changes:
+            msg = (
+                "Не удалось разобрать параметры.\n"
+                "Пример: <code>/settings volume=70000000 max_signals=5 interval=900</code>"
+            )
+            send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+        else:
+            msg = "<b>⚙️ Обновлённые настройки:</b>\n" + "\n".join(f"• {c}" for c in changes)
+            send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/risk_off" or lower == "🛑 risk off":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
         if STATE:
             STATE.activate_risk_off(CONFIG["RISK_OFF_DEFAULT_SECONDS"])
-            hours = CONFIG["RISK_OFF_DEFAULT_SECONDS"] // 3600
-            msg = (
-                f"Risk OFF режим активирован на {hours} ч.\n"
-                "Сигналы временно отключены. Для включения используйте /risk_on."
+        msg = (
+            "🛑 <b>Risk-OFF активирован.</b>\n"
+            "Торговые сигналы временно отключены.\n"
+            "Для включения используйте «🟢 Risk ON»."
+        )
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/risk_on" or lower == "🟢 risk on":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
             )
-            send_telegram_message(msg, chat_id=chat_id, html=False)
-    elif cmd == "/risk_on":
+            return
         if STATE:
             STATE.deactivate_risk_off()
-            msg = "Risk OFF режим отключён. Сигналы снова активны."
-            send_telegram_message(msg, chat_id=chat_id, html=False)
+        msg = "🟢 <b>Risk-OFF отключён.</b>\nСигналы снова активны."
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
 
 
 def telegram_polling():
@@ -830,6 +1050,20 @@ def telegram_polling():
             text = msg.get("text", "") or ""
             if text.startswith("/"):
                 handle_command(msg)
+            else:
+                lower = text.lower()
+                if lower in (
+                    "🚀 старт",
+                    "📊 статус",
+                    "ℹ️ помощь",
+                    "📴 стоп",
+                    "📈 статистика",
+                    "👥 подписчики",
+                    "⚙️ настройки",
+                    "🛑 risk off",
+                    "🟢 risk on",
+                ):
+                    handle_command(msg)
 
 
 def scan_market(state: BotState):
@@ -873,7 +1107,7 @@ def scan_market(state: BotState):
         logger.info("Подходящих сигналов не найдено.")
         return
     signals_found.sort(key=lambda s: s["risk_pct"])
-    signals_sent_this_scan = 0
+    signals_sent_this_scan = 0    # лимит за цикл
     max_per_scan = CONFIG["MAX_SIGNALS_PER_SCAN"]
     for signal in signals_found:
         if not state.can_send_signal():
@@ -914,6 +1148,7 @@ def main():
     logger.info(f"  - Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}")
     logger.info(f"  - Risk/Reward: {CONFIG['RISK_REWARD']}")
     logger.info(f"  - Мин. стоп: {CONFIG['MIN_RISK_PCT']}%")
+    logger.info(f"  - Мин. тейк: {CONFIG['MIN_TP_PCT']}%")
     logger.info(f"  - Макс. сигналов за скан: {CONFIG['MAX_SIGNALS_PER_SCAN']}")
     logger.info(f"  - Cooldown на символ: {CONFIG['SYMBOL_COOLDOWN_SECONDS']} сек")
     logger.info(f"  - BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}")
@@ -937,12 +1172,18 @@ def main():
     if tg_chat:
         welcome_msg = (
             "<b>🚀 Бот запущен!</b>\n\n"
-            "Я сканирую Binance Futures (USDT-M), основной анализ на 5m, "
-            "тренд подтверждается на 15m, учитываю BTC, ATR и базовые уровни.\n\n"
+            "Я сканирую Binance Futures (USDT-M). Основной анализ на 5m, "
+            "тренд подтверждается на 15m. Используются EMA, RSI, StochRSI, MACD, "
+            "ATR, BTC-контекст и фильтр уровней.\n\n"
             f"Первый скан будет через {CONFIG['SCAN_INTERVAL_SECONDS']} секунд.\n"
             f"Текущее количество подписчиков: {subs_count}."
         )
-        send_telegram_message(welcome_msg, chat_id=tg_chat, html=True)
+        send_telegram_message(
+            welcome_msg,
+            chat_id=tg_chat,
+            html=True,
+            reply_markup=get_reply_keyboard(tg_chat),
+        )
     polling_thread = threading.Thread(target=telegram_polling, daemon=True)
     polling_thread.start()
     STATE = BotState()
