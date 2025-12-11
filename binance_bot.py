@@ -1052,7 +1052,7 @@ def handle_command(message: Dict):
                 lines.append(f"- {cid}: {t_str}")
             msg = "\n".join(lines)
         send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
-    elif first_token == "/settings" or lower.startswith("⚙️ настройки"):
+           elif first_token == "/settings" or lower.startswith("⚙️ настройки"):
         if not is_admin:
             send_telegram_message(
                 "⛔ Эта команда доступна только администратору.",
@@ -1061,18 +1061,21 @@ def handle_command(message: Dict):
                 reply_markup=kb,
             )
             return
+
         parts = text.split()
         if len(parts) == 1:
             msg = (
                 "<b>⚙️ Текущие настройки</b>\n\n"
                 f"• MIN_QUOTE_VOLUME: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT\n"
                 f"• MAX_SIGNALS_PER_DAY: {CONFIG['MAX_SIGNALS_PER_DAY']}\n"
-                f"• SCAN_INTERVAL_SECONDS: {CONFIG['SCAN_INTERVAL_SECONDS']} сек\n\n"
+                f"• SCAN_INTERVAL_SECONDS: {CONFIG['SCAN_INTERVAL_SECONDS']} сек\n"
+                f"• MIN_ATR_PCT: {CONFIG['MIN_ATR_PCT']}%\n\n"
                 "Чтобы изменить, используйте формат:\n"
-                "<code>/settings volume=70000000 max_signals=5 interval=900</code>"
+                "<code>/settings volume=70000000 max_signals=5 interval=900 atr_min=0.05</code>"
             )
             send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
             return
+
         changes = []
         for token in parts[1:]:
             if "=" not in token:
@@ -1080,28 +1083,48 @@ def handle_command(message: Dict):
             key, val = token.split("=", 1)
             key = key.strip().lower()
             val = val.strip()
-            try:
-                ival = int(val)
-            except ValueError:
-                continue
+
             if key in ("volume", "min_volume"):
-                CONFIG["MIN_QUOTE_VOLUME"] = ival
-                changes.append(f"MIN_QUOTE_VOLUME → {ival:,}")
+                try:
+                    CONFIG["MIN_QUOTE_VOLUME"] = int(val)
+                    changes.append(f"MIN_QUOTE_VOLUME → {CONFIG['MIN_QUOTE_VOLUME']:,}")
+                except ValueError:
+                    continue
+
             elif key in ("max_signals", "max_per_day"):
-                CONFIG["MAX_SIGNALS_PER_DAY"] = ival
-                changes.append(f"MAX_SIGNALS_PER_DAY → {ival}")
+                try:
+                    CONFIG["MAX_SIGNALS_PER_DAY"] = int(val)
+                    changes.append(f"MAX_SIGNALS_PER_DAY → {CONFIG['MAX_SIGNALS_PER_DAY']}")
+                except ValueError:
+                    continue
+
             elif key in ("interval", "scan_interval"):
-                CONFIG["SCAN_INTERVAL_SECONDS"] = ival
-                changes.append(f"SCAN_INTERVAL_SECONDS → {ival} сек")
+                try:
+                    CONFIG["SCAN_INTERVAL_SECONDS"] = int(val)
+                    changes.append(
+                        f"SCAN_INTERVAL_SECONDS → {CONFIG['SCAN_INTERVAL_SECONDS']} сек"
+                    )
+                except ValueError:
+                    continue
+
+            elif key in ("atr", "atr_min", "min_atr"):
+                try:
+                    CONFIG["MIN_ATR_PCT"] = float(val)
+                    changes.append(f"MIN_ATR_PCT → {CONFIG['MIN_ATR_PCT']}%")
+                except ValueError:
+                    continue
+
         if not changes:
             msg = (
                 "Не удалось разобрать параметры.\n"
-                "Пример: <code>/settings volume=70000000 max_signals=5 interval=900</code>"
+                "Пример: <code>/settings volume=70000000 max_signals=5 interval=900 atr_min=0.05</code>"
             )
             send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
         else:
             msg = "<b>⚙️ Обновлённые настройки:</b>\n" + "\n".join(f"• {c}" for c in changes)
             send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+
+
     elif first_token == "/risk_off" or lower == "🛑 risk off":
         if not is_admin:
             send_telegram_message(
@@ -1156,28 +1179,47 @@ def telegram_polling():
             time.sleep(5)
             continue
         results = data.get("result", [])
-        for update in results:
+                for update in results:
             LAST_UPDATE_ID = update.get("update_id", LAST_UPDATE_ID)
             msg = update.get("message") or update.get("channel_post")
             if not msg:
                 continue
             text = msg.get("text", "") or ""
+            chat = msg.get("chat", {})
+            chat_id_str = str(chat.get("id"))
+
             if text.startswith("/"):
                 handle_command(msg)
             else:
-                lower = text.lower()
-                if lower in (
-                    "🚀 старт",
-                    "📊 статус",
-                    "ℹ️ помощь",
-                    "📴 стоп",
-                    "📈 статистика",
-                    "👥 подписчики",
-                    "⚙️ настройки",
-                    "🛑 risk off",
-                    "🟢 risk on",
-                ):
-                    handle_command(msg)
+                lower = text.lower().strip()
+
+                known_phrases = {
+                    "🚀 старт": "/start",
+                    "старт": "/start",
+                    "📊 статус": "/status",
+                    "статус": "/status",
+                    "ℹ️ помощь": "/help",
+                    "помощь": "/help",
+                    "📴 стоп": "/stop",
+                    "стоп": "/stop",
+                    "⚙️ настройки": "/settings",
+                    "настройки": "/settings",
+                }
+
+                mapped = known_phrases.get(lower)
+                if mapped:
+                    mapped_msg = dict(msg)
+                    mapped_msg["text"] = mapped
+                    handle_command(mapped_msg)
+                else:
+                    send_telegram_message(
+                        "Я пока не понимаю эту команду.\n"
+                        "Используйте кнопки внизу или /help для списка доступных команд.",
+                        chat_id=chat_id_str,
+                        html=False,
+                        reply_markup=get_reply_keyboard(chat_id_str),
+                    )
+
 
 
 def scan_market(state: BotState):
