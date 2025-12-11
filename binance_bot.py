@@ -161,6 +161,15 @@ def db_init_and_load_subscribers():
         );
         """
     )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS unsubscribes (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT,
+            unsubscribed_at TIMESTAMPTZ DEFAULT now()
+        );
+        """
+    )
     rows = db_execute("SELECT chat_id FROM subscribers;", fetch=True) or []
     SUBSCRIBERS.clear()
     for (cid,) in rows:
@@ -170,6 +179,7 @@ def db_init_and_load_subscribers():
 
 def db_add_subscriber(chat_id: str, is_admin: bool = False):
     cid = int(chat_id)
+    was_new = str(chat_id) not in SUBSCRIBERS
     db_execute(
         """
         INSERT INTO subscribers (chat_id, is_admin)
@@ -180,14 +190,29 @@ def db_add_subscriber(chat_id: str, is_admin: bool = False):
     )
     SUBSCRIBERS.add(str(chat_id))
     logger.info(f"Добавлен подписчик в БД: {chat_id} (admin={is_admin})")
+    admin_chat = CONFIG["TG_CHAT_ID"]
+    if was_new and not is_admin and admin_chat and str(chat_id) != admin_chat:
+        send_telegram_message(
+            f"🔔 Новый подписчик: {chat_id}",
+            chat_id=admin_chat,
+            html=False,
+        )
 
 
 def db_remove_subscriber(chat_id: str):
     cid = int(chat_id)
+    db_execute("INSERT INTO unsubscribes (chat_id) VALUES (%s);", (cid,))
     db_execute("DELETE FROM subscribers WHERE chat_id = %s;", (cid,))
     if str(chat_id) in SUBSCRIBERS:
         SUBSCRIBERS.remove(str(chat_id))
     logger.info(f"Удалён подписчик из БД: {chat_id}")
+    admin_chat = CONFIG["TG_CHAT_ID"]
+    if admin_chat and str(chat_id) != admin_chat:
+        send_telegram_message(
+            f"🔔 Пользователь отписался: {chat_id}",
+            chat_id=admin_chat,
+            html=False,
+        )
 
 
 def db_get_subscribers_count() -> int:
@@ -743,6 +768,17 @@ def broadcast_to_subscribers(message: str, html: bool = False) -> int:
 def format_signal_message(signal: Dict) -> str:
     direction_emoji = "🟢 long" if signal["direction"] == "long" else "🔴 short"
     lev = choose_leverage(signal["risk_pct"])
+    impulse_iso = signal.get("impulse_time")
+    impulse_str = str(impulse_iso)
+    try:
+        dt = datetime.fromisoformat(impulse_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        impulse_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
     atr_str = ""
     if signal.get("atr_pct") is not None:
         atr_str = f"\nATR: {signal['atr_pct']:.2f}%"
@@ -764,7 +800,7 @@ def format_signal_message(signal: Dict) -> str:
         f"{atr_str}"
         f"{macd_str}"
         f"{stoch_str}\n"
-        f"Импульсная свеча (UTC): {signal['impulse_time']}\n\n"
+        f"Импульсная свеча: {impulse_str}\n\n"
         f"Логика: импульс, стоп за экстремумом c буфером по ATR, "
         f"тейк по RR {CONFIG['RISK_REWARD']}, фильтр по тренду, "
         f"RSI, StochRSI, MACD, ATR, BTC и 15m-тренду."
@@ -938,6 +974,84 @@ def handle_command(message: Dict):
         else:
             msg = "Статистика временно недоступна."
         send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/admin_subscribers_list":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
+        rows = db_execute(
+            "SELECT chat_id, is_admin, created_at FROM subscribers ORDER BY created_at;",
+            fetch=True,
+        ) or []
+        if not rows:
+            msg = "👥 В базе сейчас нет подписчиков."
+        else:
+            lines = ["<b>👥 Список подписчиков</b>"]
+            for (cid, adm, created_at) in rows:
+                dt = created_at.astimezone(UTC)
+                t_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+                role = "admin" if adm else "user"
+                lines.append(f"- {cid} ({role}), с {t_str}")
+            msg = "\n".join(lines)
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/admin_growth":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
+        rows = db_execute(
+            """
+            SELECT (created_at AT TIME ZONE 'UTC')::date AS d, COUNT(*)
+            FROM subscribers
+            GROUP BY d
+            ORDER BY d;
+            """,
+            fetch=True,
+        ) or []
+        if not rows:
+            msg = "Пока нет данных по росту подписчиков."
+        else:
+            lines = ["<b>📊 Динамика роста подписчиков</b>", ""]
+            for d, cnt in rows:
+                lines.append(f"{d.isoformat()}: {cnt}")
+            msg = "\n".join(lines)
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+    elif first_token == "/admin_unsub_stats":
+        if not is_admin:
+            send_telegram_message(
+                "⛔ Эта команда доступна только администратору.",
+                chat_id=chat_id,
+                html=False,
+                reply_markup=kb,
+            )
+            return
+        rows = db_execute(
+            """
+            SELECT chat_id, unsubscribed_at
+            FROM unsubscribes
+            ORDER BY unsubscribed_at DESC
+            LIMIT 30;
+            """,
+            fetch=True,
+        ) or []
+        if not rows:
+            msg = "Пока никто не отписывался."
+        else:
+            lines = ["<b>📉 Отписки (последние события)</b>", ""]
+            for cid, unsub_at in rows:
+                dt = unsub_at.astimezone(UTC)
+                t_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+                lines.append(f"- {cid}: {t_str}")
+            msg = "\n".join(lines)
+        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
     elif first_token == "/settings" or lower.startswith("⚙️ настройки"):
         if not is_admin:
             send_telegram_message(
@@ -1107,7 +1221,7 @@ def scan_market(state: BotState):
         logger.info("Подходящих сигналов не найдено.")
         return
     signals_found.sort(key=lambda s: s["risk_pct"])
-    signals_sent_this_scan = 0    # лимит за цикл
+    signals_sent_this_scan = 0
     max_per_scan = CONFIG["MAX_SIGNALS_PER_SCAN"]
     for signal in signals_found:
         if not state.can_send_signal():
