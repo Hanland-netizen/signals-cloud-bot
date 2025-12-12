@@ -630,7 +630,7 @@ def analyse_symbol(
     if symbol == "BTCUSDT":
         return None
 
-) -> Optional[Dict[str, Any]]:
+
     params = {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300}
     kl_5m = fetch_binance("/fapi/v1/klines", params)
     o5, h5, l5, c5, t5 = kline_to_floats(kl_5m)
