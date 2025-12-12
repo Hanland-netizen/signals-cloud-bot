@@ -1,3 +1,6 @@
+
+print(">>> RUNNING FILE:", __file__)
+
 import os
 import sys
 import time
