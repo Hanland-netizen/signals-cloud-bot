@@ -845,7 +845,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     kb = get_reply_keyboard(chat_id)
 
     # нормализуем ввод (кнопки/эмодзи)
-    lower = normalize_command(text_in).lower()
+    lower = text_in.lower()
     first_token = (text_in.split()[:1] or [""])[0].lower()
 
     # ===== Пользовательские команды =====
