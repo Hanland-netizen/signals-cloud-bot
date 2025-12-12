@@ -39,7 +39,7 @@ CONFIG: Dict[str, Any] = {
     "MIN_ATR_PCT": 0.15,
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.15,
-    "MAX_STOP_PCT": 2.50,
+    "MAX_STOP_PCT": 0.80,
     "MAX_SIGNALS_PER_SCAN": 1,
     "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
     "SYMBOL_COOLDOWN_SECONDS": 3600,
@@ -625,59 +625,74 @@ def analyse_symbol(
     klines_5m: List[List[Any]],
     klines_15m: List[List[Any]],
 ) -> Optional[Dict[str, Any]]:
+    """Возвращает торговую идею или None.
 
-    # ❌ полностью исключаем BTC из сигналов
+    Улучшения для точности:
+    - работаем ТОЛЬКО по закрытым свечам (исключаем последнюю, которая может быть незакрытой)
+    - реальная проверка 'импульсной' свечи (range/body относительно ATR)
+    - подтверждение по HTF EMA200 (15m) по направлению
+    - разворот StochRSI (сигнал берём на переломе, а не "где угодно")
+    - подтверждение пробоя экстремума импульсной свечи (опционально)
+    """
+
+    # ❌ полностью исключаем BTC из сигналов (но BTC-фильтр для альтов остаётся)
     if symbol == "BTCUSDT":
         return None
-
 
     # Используем уже переданные klines (чтобы не делать лишние запросы к Binance)
     o5, h5, l5, c5, t5 = kline_to_floats(klines_5m)
     _, _, _, c15, _ = kline_to_floats(klines_15m)
 
-    ema200_5m = calc_ema(c5, 200)
-    ema200_15m = calc_ema(c15, 200)
-    rsi_5m = calc_rsi(c5, 14)
-    atr_list = calc_atr(h5, l5, c5, 14)
-    macd_line, signal_line = calc_macd(c5)
-    stoch_rsi = calc_stoch_rsi(c5)
-
-    if len(c5) < 210 or len(ema200_5m) < 1 or len(atr_list) < 1:
+    # Безопасность: исключаем последнюю (возможно незакрытую) свечу
+    if len(c5) < 220 or len(c15) < 220:
         return None
+    o5c, h5c, l5c, c5c, t5c = o5[:-1], h5[:-1], l5[:-1], c5[:-1], t5[:-1]
+    c15c = c15[:-1]
 
-    close = c5[-1]
+    ema200_5m = calc_ema(c5c, 200)
+    ema200_15m = calc_ema(c15c, 200)
+    rsi_5m = calc_rsi(c5c, 14)
+    atr_list = calc_atr(h5c, l5c, c5c, 14)
+    macd_line, signal_line = calc_macd(c5c)
+    stoch_rsi = calc_stoch_rsi(c5c)
+
+    # текущая закрытая свеча = последняя в срезе
+    close = c5c[-1]
     ema = ema200_5m[-1]
     ema_htf = ema200_15m[-1] if ema200_15m else ema
     rsi = rsi_5m[-1]
     atr_abs = atr_list[-1]
     atr_pct = atr_abs / close * 100.0
     macd_val = macd_line[-1]
-    macd_prev = macd_line[-2]
     macd_signal = signal_line[-1]
+    macd_prev = macd_line[-2]
     stoch_val = stoch_rsi[-1]
+    stoch_prev = stoch_rsi[-2]
 
+    # ATR фильтр
     if not (CONFIG["MIN_ATR_PCT"] <= atr_pct <= CONFIG["MAX_ATR_PCT"]):
-        logging.info(
-            "%s отклонён по ATR: %.2f%% (допустимо %.2f–%.2f%%).",
-            symbol,
-            atr_pct,
-            CONFIG["MIN_ATR_PCT"],
-            CONFIG["MAX_ATR_PCT"],
-        )
         return None
 
+    # ====== Направление по тренду/моментуму (как и раньше, но чуть строже) ======
     price_above = close > ema * 1.001
     price_below = close < ema * 0.999
 
     side: Optional[str] = None
-    if price_above and rsi > 50 and macd_val > macd_signal and stoch_val > 20:
+    if price_above and rsi > 50 and macd_val > macd_signal and macd_val > macd_prev:
         side = "long"
-    elif price_below and rsi < 50 and macd_val < macd_signal and stoch_val < 80:
+    elif price_below and rsi < 50 and macd_val < macd_signal and macd_val < macd_prev:
         side = "short"
-
-    if side is None:
+    else:
         return None
 
+    # Подтверждение HTF EMA200 (15m)
+    if CONFIG.get("REQUIRE_HTF_EMA_CONFIRM", True):
+        if side == "long" and close < ema_htf:
+            return None
+        if side == "short" and close > ema_htf:
+            return None
+
+    # BTC фильтр (как у тебя, оставляем)
     if CONFIG["BTC_FILTER_ENABLED"]:
         btc_price = btc_ctx["price"]
         btc_ema = btc_ctx["ema200"]
@@ -685,39 +700,72 @@ def analyse_symbol(
         btc_change = btc_ctx["change_pct"]
         if side == "long":
             if btc_price < btc_ema or btc_rsi < 45 or btc_change < -3.0:
-                logging.info("%s отклонён по BTC-фильтру для long.", symbol)
                 return None
         else:
             if btc_price > btc_ema or btc_rsi > 55 or btc_change > 3.0:
-                logging.info("%s отклонён по BTC-фильтру для short.", symbol)
                 return None
 
-    impulse_idx = len(c5) - 2
-    impulse_close = c5[impulse_idx]
-    impulse_low = l5[impulse_idx]
-    impulse_high = h5[impulse_idx]
-    impulse_time = datetime.fromtimestamp(t5[impulse_idx] / 1000, timezone.utc)
+    # ====== Реальная "импульсная свеча" ======
+    # импульс = предпоследняя закрытая свеча
+    impulse_idx = len(c5c) - 2
+    impulse_open = o5c[impulse_idx]
+    impulse_close = c5c[impulse_idx]
+    impulse_low = l5c[impulse_idx]
+    impulse_high = h5c[impulse_idx]
+    impulse_time = datetime.fromtimestamp(t5c[impulse_idx] / 1000, timezone.utc)
 
+    impulse_range = impulse_high - impulse_low
+    impulse_body = abs(impulse_close - impulse_open)
+
+    # требования к силе импульса относительно ATR
+    if impulse_range < atr_abs * float(CONFIG.get("IMPULSE_RANGE_ATR_MULT", 1.30)):
+        return None
+    if impulse_body < atr_abs * float(CONFIG.get("IMPULSE_BODY_ATR_MULT", 0.60)):
+        return None
+
+    # направление импульса должно совпадать с направлением сделки
+    is_bull_impulse = impulse_close > impulse_open
+    is_bear_impulse = impulse_close < impulse_open
+    if side == "long" and not is_bull_impulse:
+        return None
+    if side == "short" and not is_bear_impulse:
+        return None
+
+    # подтверждение по StochRSI (разворот/перелом)
+    if CONFIG.get("REQUIRE_STOCH_REVERSAL", True):
+        if side == "long":
+            # хотим выход из перепроданности
+            if not (stoch_prev < 20 and stoch_val > stoch_prev):
+                return None
+        else:
+            # хотим разворот из перекупленности
+            if not (stoch_prev > 80 and stoch_val < stoch_prev):
+                return None
+
+    # подтверждение пробоя экстремума импульсной свечи (чтобы вход был "не раньше времени")
+    if CONFIG.get("CONFIRM_BREAKOUT", True):
+        if side == "long" and close <= impulse_high:
+            return None
+        if side == "short" and close >= impulse_low:
+            return None
+
+    # ====== Стоп/тейк: стоп за экстремумом импульса ======
     if side == "long":
         stop_loss = impulse_low * 0.999
         stop_pct = abs((close - stop_loss) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             return None
         take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"]
+        tp_pct = abs((take_profit - close) / close) * 100.0
     else:
         stop_loss = impulse_high * 1.001
         stop_pct = abs((stop_loss - close) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             return None
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"]
-
-    leverage = 20 if side == "short" else 20
-
-    # проценты для статистики
-    if side == "long":
-        tp_pct = abs((take_profit - close) / close) * 100.0
-    else:
         tp_pct = abs((close - take_profit) / close) * 100.0
+
+    leverage = 20
 
     return {
         "symbol": symbol,
@@ -727,6 +775,7 @@ def analyse_symbol(
         "take_profit": take_profit,
         "stop_loss": stop_loss,
         "ema200": ema,
+        "ema200_htf": ema_htf,
         "rsi": rsi,
         "impulse_time": impulse_time,
         "atr_pct": atr_pct,
@@ -762,9 +811,7 @@ def scan_market_and_send_signals() -> int:
             break
         if not STATE.can_send_signal(symbol):
             continue
-        kl_5m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300})
-        kl_15m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": 200})
-        idea = analyse_symbol(symbol, btc_ctx, kl_5m, kl_15m)
+        idea = analyse_symbol(symbol, btc_ctx)
         if not idea:
             continue
         text = build_signal_text(
