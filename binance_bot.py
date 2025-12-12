@@ -39,11 +39,11 @@ CONFIG: Dict[str, Any] = {
     "MIN_ATR_PCT": 0.15,
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.15,
-    "MAX_STOP_PCT": 0.80,
+    "MAX_STOP_PCT": 3.00,
     "MAX_SIGNALS_PER_SCAN": 1,
     "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
     "SYMBOL_COOLDOWN_SECONDS": 3600,
-    "BTC_FILTER_ENABLED": True,
+    "BTC_FILTER_ENABLED": False,
     "EXCLUDED_SYMBOLS": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
 
 }
@@ -564,13 +564,7 @@ def get_btc_context() -> Dict[str, Any]:
         "rsi": rsi,
         "change_pct": change_pct,
     }
-    logging.info(
-        "BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
-        price,
-        ema200,
-        rsi,
-        change_pct,
-    )
+    # BTC context logging removed
     return ctx
 
 
@@ -622,8 +616,6 @@ def build_signal_text(
 def analyse_symbol(
     symbol: str,
     btc_ctx: Dict[str, Any],
-    klines_5m: List[Dict[str, Any]],
-    klines_15m: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
 
     # ❌ полностью исключаем BTC из сигналов
@@ -748,7 +740,7 @@ def scan_market_and_send_signals() -> int:
     if in_fomc_window(now_utc):
         logging.info("Сейчас окно FOMC, сканирование отключено.")
         return 0
-    btc_ctx = get_btc_context()
+    btc_ctx = get_btc_context() if CONFIG.get("BTC_FILTER_ENABLED") else {}
     symbols = get_usdt_perp_symbols()
     symbols = get_24h_volume_filter(symbols)
     logging.info("Анализ %d символов...", len(symbols))
