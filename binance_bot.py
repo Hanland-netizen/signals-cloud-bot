@@ -1,10 +1,9 @@
 import os
 import time
-import math
 import json
 import logging
 import signal
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, date, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import requests
@@ -23,6 +22,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_ADMIN_ID = os.environ.get("TG_ADMIN_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
+# Если нужно — сюда добавь даты FOMC в UTC (datetime with tzinfo=timezone.utc)
 FOMC_DATES_UTC: List[datetime] = []
 
 CONFIG: Dict[str, Any] = {
@@ -41,6 +41,9 @@ CONFIG: Dict[str, Any] = {
     "BTC_FILTER_ENABLED": True,
 }
 
+# =========================
+# STATE
+# =========================
 
 class SignalState:
     def __init__(self) -> None:
@@ -63,10 +66,7 @@ class SignalState:
             return False
         now = time.time()
         last_ts = self.symbol_last_signal_ts.get(symbol)
-        if (
-            last_ts is not None
-            and now - last_ts < CONFIG["SYMBOL_COOLDOWN_SECONDS"]
-        ):
+        if last_ts is not None and now - last_ts < CONFIG["SYMBOL_COOLDOWN_SECONDS"]:
             return False
         return True
 
@@ -84,6 +84,9 @@ class SignalState:
 
 STATE = SignalState()
 
+# =========================
+# DB
+# =========================
 
 def db_connect():
     if not DATABASE_URL:
@@ -92,9 +95,7 @@ def db_connect():
     conn.autocommit = True
     return conn
 
-
 DB_CONN = None
-
 
 def db_ensure_tables() -> None:
     global DB_CONN
@@ -114,7 +115,6 @@ def db_ensure_tables() -> None:
         )
     logging.info("Таблица subscribers проверена/создана.")
 
-
 def db_add_or_update_subscriber(chat_id: str, is_admin: bool) -> None:
     global DB_CONN
     if DB_CONN is None:
@@ -132,10 +132,7 @@ def db_add_or_update_subscriber(chat_id: str, is_admin: bool) -> None:
             """,
             (int(chat_id), is_admin),
         )
-    logging.info(
-        "Добавлен подписчик в БД: %s (admin=%s)", chat_id, "True" if is_admin else "False"
-    )
-
+    logging.info("Добавлен подписчик в БД: %s (admin=%s)", chat_id, "True" if is_admin else "False")
 
 def db_unsubscribe(chat_id: str) -> None:
     global DB_CONN
@@ -152,42 +149,27 @@ def db_unsubscribe(chat_id: str) -> None:
         )
     logging.info("Подписчик %s помечен как неактивный.", chat_id)
 
-
 def db_get_active_subscribers() -> List[int]:
     global DB_CONN
     if DB_CONN is None:
         DB_CONN = db_connect()
     with DB_CONN.cursor() as cur:
-        cur.execute(
-            "SELECT chat_id FROM subscribers WHERE is_active = TRUE;"
-        )
+        cur.execute("SELECT chat_id FROM subscribers WHERE is_active = TRUE;")
         rows = cur.fetchall()
     return [int(r["chat_id"]) for r in rows]
-
 
 def db_get_subscribers_count() -> int:
     global DB_CONN
     if DB_CONN is None:
         DB_CONN = db_connect()
     with DB_CONN.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) AS c FROM subscribers WHERE is_active = TRUE;"
-        )
+        cur.execute("SELECT COUNT(*) AS c FROM subscribers WHERE is_active = TRUE;")
         row = cur.fetchone()
     return int(row["c"]) if row else 0
 
-
-def db_get_admin_chat_ids() -> List[int]:
-    global DB_CONN
-    if DB_CONN is None:
-        DB_CONN = db_connect()
-    with DB_CONN.cursor() as cur:
-        cur.execute(
-            "SELECT chat_id FROM subscribers WHERE is_admin = TRUE AND is_active = TRUE;"
-        )
-        rows = cur.fetchall()
-    return [int(r["chat_id"]) for r in rows]
-
+# =========================
+# TELEGRAM
+# =========================
 
 def send_telegram_request(method: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not TELEGRAM_BOT_TOKEN:
@@ -195,13 +177,12 @@ def send_telegram_request(method: str, data: Dict[str, Any]) -> Optional[Dict[st
         return None
     url = f"{TELEGRAM_API_URL}/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        resp = requests.post(url, json=data, timeout=15)
+        resp = requests.post(url, json=data, timeout=20)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
         logging.error("Ошибка запроса к Telegram (%s): %s", method, e)
         return None
-
 
 def send_telegram_message(
     text: str,
@@ -214,6 +195,7 @@ def send_telegram_message(
             logging.error("Нет chat_id для отправки сообщения.")
             return
         chat_id = TG_ADMIN_ID
+
     payload: Dict[str, Any] = {
         "chat_id": int(chat_id),
         "text": text,
@@ -223,57 +205,108 @@ def send_telegram_message(
         payload["parse_mode"] = "HTML"
     if reply_markup:
         payload["reply_markup"] = reply_markup
+
     res = send_telegram_request("sendMessage", payload)
     if res and res.get("ok"):
         logging.info("Сообщение отправлено в Telegram")
     else:
         logging.error("Ошибка отправки в Telegram: %s", res)
 
+def edit_telegram_message(
+    chat_id: str,
+    message_id: int,
+    text: str,
+    html: bool = False,
+    reply_markup: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if html:
+        payload["parse_mode"] = "HTML"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    send_telegram_request("editMessageText", payload)
+
+def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False) -> None:
+    payload = {
+        "callback_query_id": callback_query_id,
+        "text": text,
+        "show_alert": show_alert,
+    }
+    send_telegram_request("answerCallbackQuery", payload)
+
+# =========================
+# KEYBOARDS
+# =========================
+
+def admin_inline_panel() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Статус", "callback_data": "admin:status"},
+                {"text": "👥 Подписчики", "callback_data": "admin:subs"},
+            ],
+            [
+                {"text": "⚙️ Настройки", "callback_data": "admin:cfg"},
+                {"text": "🧪 Тест-скан", "callback_data": "admin:test"},
+            ],
+            [
+                {"text": "🛑 Risk OFF", "callback_data": "admin:risk_off"},
+                {"text": "✅ Risk ON", "callback_data": "admin:risk_on"},
+            ],
+        ]
+    }
 
 def get_reply_keyboard(chat_id: str) -> Dict[str, Any]:
-    is_admin = TG_ADMIN_ID and str(chat_id) == TG_ADMIN_ID
+    is_admin = (str(chat_id) == TG_ADMIN_ID) if TG_ADMIN_ID else False
+
     user_buttons = [
         [{"text": "🚀 Старт"}, {"text": "📊 Статус"}],
         [{"text": "ℹ️ Помощь"}, {"text": "📴 Стоп"}],
     ]
     if is_admin:
-        user_buttons.append([{"text": "⚙️ Настройки"}])
+        user_buttons.append([{"text": "🛠 Админ"}, {"text": "⚙️ Настройки"}])
+
     return {
         "keyboard": user_buttons,
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
 
+# =========================
+# BINANCE
+# =========================
 
 def fetch_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{BINANCE_FAPI_URL}{path}"
     for attempt in range(5):
         try:
-            resp = requests.get(url, params=params, timeout=10)
+            resp = requests.get(url, params=params, timeout=12)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             delay = 2 ** attempt
             logging.error(
                 "Ошибка запроса к %s (попытка %d/5): %s. Ждём %d сек перед повтором...",
-                path,
-                attempt + 1,
-                e,
-                delay,
+                path, attempt + 1, e, delay
             )
             time.sleep(delay)
     raise RuntimeError(f"Не удалось получить данные с Binance: {path}")
-
 
 def get_usdt_perp_symbols() -> List[str]:
     data = fetch_binance("/fapi/v1/exchangeInfo")
     symbols = []
     for s in data.get("symbols", []):
         if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT":
-            symbols.append(s["symbol"])
-    logging.info("Найдено %d USDT-M PERPETUAL символов", len(symbols))
+            # FIX: отсечём не торгуемые
+            if s.get("status") == "TRADING":
+                symbols.append(s["symbol"])
+    logging.info("Найдено %d USDT-M PERPETUAL символов (TRADING)", len(symbols))
     return symbols
-
 
 def get_24h_volume_filter(symbols: List[str]) -> List[str]:
     tickers = fetch_binance("/fapi/v1/ticker/24hr")
@@ -285,9 +318,7 @@ def get_24h_volume_filter(symbols: List[str]) -> List[str]:
                 vol_map[s] = float(t.get("quoteVolume", 0.0))
             except Exception:
                 continue
-    filtered = [
-        s for s in symbols if vol_map.get(s, 0.0) >= CONFIG["MIN_QUOTE_VOLUME"]
-    ]
+    filtered = [s for s in symbols if vol_map.get(s, 0.0) >= CONFIG["MIN_QUOTE_VOLUME"]]
     logging.info(
         "После фильтрации по объёму (>= %s USDT): %d символов",
         f"{CONFIG['MIN_QUOTE_VOLUME']:,}",
@@ -295,6 +326,9 @@ def get_24h_volume_filter(symbols: List[str]) -> List[str]:
     )
     return filtered
 
+# =========================
+# INDICATORS
+# =========================
 
 def kline_to_floats(klines: List[List[Any]]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
     opens: List[float] = []
@@ -304,17 +338,10 @@ def kline_to_floats(klines: List[List[Any]]) -> Tuple[List[float], List[float], 
     timestamps: List[float] = []
     for k in klines:
         ts = k[0]
-        o = float(k[1])
-        h = float(k[2])
-        l = float(k[3])
-        c = float(k[4])
+        o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
         timestamps.append(ts)
-        opens.append(o)
-        highs.append(h)
-        lows.append(l)
-        closes.append(c)
+        opens.append(o); highs.append(h); lows.append(l); closes.append(c)
     return opens, highs, lows, closes, timestamps
-
 
 def calc_ema(values: List[float], period: int) -> List[float]:
     if not values or period <= 1:
@@ -328,7 +355,6 @@ def calc_ema(values: List[float], period: int) -> List[float]:
         ema.append(ema_prev)
     return ema
 
-
 def calc_rsi(values: List[float], period: int) -> List[float]:
     if len(values) <= period:
         return [50.0 for _ in values]
@@ -338,8 +364,8 @@ def calc_rsi(values: List[float], period: int) -> List[float]:
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
-    avg_gain = sum(gains[1 : period + 1]) / period
-    avg_loss = sum(losses[1 : period + 1]) / period
+    avg_gain = sum(gains[1: period + 1]) / period
+    avg_loss = sum(losses[1: period + 1]) / period
     rsi: List[float] = [50.0] * period
     if avg_loss == 0:
         rsi.append(100.0)
@@ -355,7 +381,6 @@ def calc_rsi(values: List[float], period: int) -> List[float]:
             rs = avg_gain / avg_loss
             rsi.append(100 - 100 / (1 + rs))
     return rsi
-
 
 def calc_atr(highs: List[float], lows: List[float], closes: List[float], period: int) -> List[float]:
     trs: List[float] = []
@@ -380,7 +405,6 @@ def calc_atr(highs: List[float], lows: List[float], closes: List[float], period:
         atr.append(prev)
     return atr
 
-
 def calc_macd(values: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float]]:
     ema_fast = calc_ema(values, fast)
     ema_slow = calc_ema(values, slow)
@@ -388,49 +412,36 @@ def calc_macd(values: List[float], fast: int = 12, slow: int = 26, signal: int =
     signal_line = calc_ema(macd_line, signal)
     return macd_line, signal_line
 
-
 def calc_stoch_rsi(values: List[float], period: int = 14) -> List[float]:
     rsi = calc_rsi(values, period)
     if len(rsi) <= period:
         return [50.0 for _ in rsi]
     stoch: List[float] = [50.0] * period
     for i in range(period, len(rsi)):
-        window = rsi[i - period + 1 : i + 1]
-        rmin = min(window)
-        rmax = max(window)
+        window = rsi[i - period + 1: i + 1]
+        rmin = min(window); rmax = max(window)
         if rmax - rmin == 0:
             stoch.append(50.0)
         else:
             stoch.append((rsi[i] - rmin) / (rmax - rmin) * 100.0)
     return stoch
 
+# =========================
+# FILTERS / STRATEGY
+# =========================
 
 def get_btc_context() -> Dict[str, Any]:
-    kl = fetch_binance(
-        "/fapi/v1/klines",
-        {"symbol": "BTCUSDT", "interval": "5m", "limit": 300},
-    )
+    kl = fetch_binance("/fapi/v1/klines", {"symbol": "BTCUSDT", "interval": "5m", "limit": 300})
     _, _, _, closes, _ = kline_to_floats(kl)
     ema200 = calc_ema(closes, 200)[-1]
     rsi = calc_rsi(closes, 14)[-1]
     ticker = fetch_binance("/fapi/v1/ticker/24hr", {"symbol": "BTCUSDT"})
     price = float(ticker.get("lastPrice", closes[-1]))
     change_pct = float(ticker.get("priceChangePercent", 0.0))
-    ctx = {
-        "price": price,
-        "ema200": ema200,
-        "rsi": rsi,
-        "change_pct": change_pct,
-    }
-    logging.info(
-        "BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
-        price,
-        ema200,
-        rsi,
-        change_pct,
-    )
+    ctx = {"price": price, "ema200": ema200, "rsi": rsi, "change_pct": change_pct}
+    logging.info("BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
+                 price, ema200, rsi, change_pct)
     return ctx
-
 
 def in_fomc_window(now_utc: datetime) -> bool:
     if not FOMC_DATES_UTC:
@@ -439,7 +450,6 @@ def in_fomc_window(now_utc: datetime) -> bool:
         if abs((now_utc - dt).total_seconds()) <= 3600:
             return True
     return False
-
 
 def build_signal_text(
     symbol: str,
@@ -476,14 +486,11 @@ def build_signal_text(
         f"{CONFIG['RISK_REWARD']}, фильтр по тренду, ATR, BTC и осцилляторам."
     )
 
-
-def analyse_symbol(
-    symbol: str,
-    btc_ctx: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+def analyse_symbol(symbol: str, btc_ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     params = {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300}
     kl_5m = fetch_binance("/fapi/v1/klines", params)
     o5, h5, l5, c5, t5 = kline_to_floats(kl_5m)
+
     params_htf = {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": 200}
     kl_15m = fetch_binance("/fapi/v1/klines", params_htf)
     _, _, _, c15, _ = kline_to_floats(kl_15m)
@@ -500,23 +507,15 @@ def analyse_symbol(
 
     close = c5[-1]
     ema = ema200_5m[-1]
-    ema_htf = ema200_15m[-1] if ema200_15m else ema
+    _ema_htf = ema200_15m[-1] if ema200_15m else ema  # оставил переменную (можешь использовать дальше)
     rsi = rsi_5m[-1]
     atr_abs = atr_list[-1]
     atr_pct = atr_abs / close * 100.0
     macd_val = macd_line[-1]
-    macd_prev = macd_line[-2]
     macd_signal = signal_line[-1]
     stoch_val = stoch_rsi[-1]
 
     if not (CONFIG["MIN_ATR_PCT"] <= atr_pct <= CONFIG["MAX_ATR_PCT"]):
-        logging.info(
-            "%s отклонён по ATR: %.2f%% (допустимо %.2f–%.2f%%).",
-            symbol,
-            atr_pct,
-            CONFIG["MIN_ATR_PCT"],
-            CONFIG["MAX_ATR_PCT"],
-        )
         return None
 
     price_above = close > ema * 1.001
@@ -538,15 +537,12 @@ def analyse_symbol(
         btc_change = btc_ctx["change_pct"]
         if side == "long":
             if btc_price < btc_ema or btc_rsi < 45 or btc_change < -3.0:
-                logging.info("%s отклонён по BTC-фильтру для long.", symbol)
                 return None
         else:
             if btc_price > btc_ema or btc_rsi > 55 or btc_change > 3.0:
-                logging.info("%s отклонён по BTC-фильтру для short.", symbol)
                 return None
 
     impulse_idx = len(c5) - 2
-    impulse_close = c5[impulse_idx]
     impulse_low = l5[impulse_idx]
     impulse_high = h5[impulse_idx]
     impulse_time = datetime.fromtimestamp(t5[impulse_idx] / 1000, timezone.utc)
@@ -564,7 +560,7 @@ def analyse_symbol(
             return None
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"]
 
-    leverage = 20 if side == "short" else 20
+    leverage = 20
 
     return {
         "symbol": symbol,
@@ -580,7 +576,6 @@ def analyse_symbol(
         "macd": macd_val,
         "stoch_rsi": stoch_val,
     }
-
 
 def scan_market_and_send_signals() -> None:
     if STATE.is_risk_off():
@@ -608,9 +603,11 @@ def scan_market_and_send_signals() -> None:
             break
         if not STATE.can_send_signal(symbol):
             continue
+
         idea = analyse_symbol(symbol, btc_ctx)
         if not idea:
             continue
+
         text = build_signal_text(
             symbol=idea["symbol"],
             side=idea["side"],
@@ -628,11 +625,10 @@ def scan_market_and_send_signals() -> None:
         )
         for cid in active_subs:
             send_telegram_message(text, chat_id=str(cid), html=True)
+
         STATE.register_signal(symbol)
         signals_for_scan += 1
-        logging.info(
-            "Сигнал отправлен: %s %s", symbol, idea["side"]
-        )
+        logging.info("Сигнал отправлен: %s %s", symbol, idea["side"])
 
     logging.info(
         "Сканирование завершено. Отправлено сигналов: %d, всего за день: %d/%d",
@@ -641,33 +637,142 @@ def scan_market_and_send_signals() -> None:
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
 
+# =========================
+# ADMIN PANEL HANDLERS
+# =========================
+
+def admin_status_text() -> str:
+    subs_count = db_get_subscribers_count()
+    risk_off_state = "активен" if STATE.is_risk_off() else "выключен"
+    return (
+        "<b>🛠 Админ-панель — Статус</b>\n\n"
+        f"👥 Подписчиков: {subs_count}\n"
+        f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
+        f"🛑 Risk OFF: {risk_off_state}\n\n"
+        f"⏱ Интервал скана: {CONFIG['SCAN_INTERVAL_SECONDS']} сек\n"
+        f"📈 TF: {CONFIG['TIMEFRAME']} (MTF: {CONFIG['HTF_TIMEFRAME']})\n"
+        f"💰 Мин. объём: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT\n"
+        f"💹 BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}"
+    )
+
+def admin_cfg_text() -> str:
+    cfg_lines = [
+        "<b>🛠 Админ-панель — Настройки</b>\n",
+        f"TIMEFRAME: {CONFIG['TIMEFRAME']}",
+        f"HTF_TIMEFRAME: {CONFIG['HTF_TIMEFRAME']}",
+        f"SCAN_INTERVAL_SECONDS: {CONFIG['SCAN_INTERVAL_SECONDS']}",
+        f"MAX_SIGNALS_PER_DAY: {CONFIG['MAX_SIGNALS_PER_DAY']}",
+        f"MAX_SIGNALS_PER_SCAN: {CONFIG['MAX_SIGNALS_PER_SCAN']}",
+        f"MIN_QUOTE_VOLUME: {CONFIG['MIN_QUOTE_VOLUME']:,}",
+        f"BTC_FILTER_ENABLED: {CONFIG['BTC_FILTER_ENABLED']}",
+        f"ATR MIN/MAX: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%",
+        f"STOP MIN/MAX: {CONFIG['MIN_STOP_PCT']}–{CONFIG['MAX_STOP_PCT']}%",
+        f"RR: {CONFIG['RISK_REWARD']}",
+        "",
+        "Изменение через команду:",
+        "<code>/settings volume=70000000 max_signals=7 interval=900 atr=0.05</code>",
+        "(max_signals = MAX_SIGNALS_PER_DAY)",
+    ]
+    return "\n".join(cfg_lines)
+
+def admin_subs_text() -> str:
+    subs = db_get_active_subscribers()
+    lines = ["<b>🛠 Админ-панель — Подписчики</b>", ""]
+    if not subs:
+        lines.append("Подписчиков нет.")
+    else:
+        for cid in subs[:60]:
+            lines.append(f"• <code>{cid}</code>")
+        if len(subs) > 60:
+            lines.append(f"\n…и ещё {len(subs) - 60}")
+    return "\n".join(lines)
+
+def handle_callback_query_update(upd: Dict[str, Any]) -> None:
+    cq = upd.get("callback_query") or {}
+    cq_id = cq.get("id", "")
+    data = cq.get("data", "") or ""
+
+    from_user = cq.get("from", {}) or {}
+    user_id = str(from_user.get("id", ""))
+
+    msg = cq.get("message", {}) or {}
+    chat = msg.get("chat", {}) or {}
+    chat_id = str(chat.get("id", ""))
+    message_id = int(msg.get("message_id", 0))
+
+    is_admin = bool(TG_ADMIN_ID) and (user_id == str(TG_ADMIN_ID))
+    if not is_admin:
+        answer_callback_query(cq_id, "Нет доступа", show_alert=True)
+        return
+
+    answer_callback_query(cq_id)
+
+    if data == "admin:status":
+        edit_telegram_message(chat_id, message_id, admin_status_text(), html=True, reply_markup=admin_inline_panel())
+        return
+
+    if data == "admin:subs":
+        edit_telegram_message(chat_id, message_id, admin_subs_text(), html=True, reply_markup=admin_inline_panel())
+        return
+
+    if data == "admin:cfg":
+        edit_telegram_message(chat_id, message_id, admin_cfg_text(), html=True, reply_markup=admin_inline_panel())
+        return
+
+    if data == "admin:risk_off":
+        STATE.set_risk_off(True)
+        edit_telegram_message(chat_id, message_id, "<b>🛑 Risk OFF включён</b>", html=True, reply_markup=admin_inline_panel())
+        return
+
+    if data == "admin:risk_on":
+        STATE.set_risk_off(False)
+        edit_telegram_message(chat_id, message_id, "<b>✅ Risk OFF выключен</b>", html=True, reply_markup=admin_inline_panel())
+        return
+
+    if data == "admin:test":
+        # быстрый тест: один скан принудительно
+        try:
+            scan_market_and_send_signals()
+            edit_telegram_message(chat_id, message_id, "<b>🧪 Тест-скан выполнен</b>", html=True, reply_markup=admin_inline_panel())
+        except Exception as e:
+            edit_telegram_message(chat_id, message_id, f"<b>🧪 Тест-скан ошибка</b>\n<code>{e}</code>", html=True, reply_markup=admin_inline_panel())
+        return
+
+    edit_telegram_message(chat_id, message_id, "<b>Неизвестная команда админки</b>", html=True, reply_markup=admin_inline_panel())
+
+# =========================
+# COMMAND HANDLER (messages)
+# =========================
 
 def handle_command(update: Dict[str, Any]) -> None:
     msg = update.get("message") or update.get("edited_message") or {}
-    text = msg.get("text", "") or ""
+    text = (msg.get("text", "") or "").strip()
+
     chat = msg.get("chat", {}) or {}
-    chat_id = str(chat.get("id"))
+    chat_id = str(chat.get("id", ""))
+
     user = msg.get("from", {}) or {}
-    user_id = str(user.get("id"))
-    is_admin = TG_ADMIN_ID and user_id == TG_ADMIN_ID
-    lower = text.strip().lower()
-    first_token = text.split()[0]
+    user_id = str(user.get("id", ""))
+
+    is_admin = bool(TG_ADMIN_ID) and (user_id == str(TG_ADMIN_ID))
+
+    lower = text.lower().strip()
+    parts = text.split()
+    first_token = parts[0] if parts else ""
 
     kb = get_reply_keyboard(chat_id)
 
-    if first_token in ("/start", "🚀 старт"):
+    if first_token in ("/start",) or lower == "🚀 старт":
         db_add_or_update_subscriber(chat_id, is_admin=is_admin)
+
         if TG_ADMIN_ID and user_id != TG_ADMIN_ID and TG_ADMIN_ID.isdigit():
             admin_message = (
                 f"Новый подписчик: <code>{chat_id}</code>\n"
                 f"Имя: {user.get('first_name', '')} {user.get('last_name', '')}\n"
                 f"Username: @{user.get('username', '')}"
             )
-            send_telegram_message(
-                admin_message,
-                chat_id=TG_ADMIN_ID,
-                html=True,
-            )
+            send_telegram_message(admin_message, chat_id=TG_ADMIN_ID, html=True)
+
         intro = (
             "🚀 <b>Бот запущен!</b> Вы подписались на торговые сигналы Binance Futures (USDT-M).\n\n"
             "Я сканирую Binance Futures, основной анализ на 5m, тренд подтверждается на 15m, "
@@ -677,31 +782,37 @@ def handle_command(update: Dict[str, Any]) -> None:
             "• 📊 Статус — состояние бота\n"
             "• ℹ️ Помощь — описание логики\n"
             "• 📴 Стоп — отписаться от сигналов\n\n"
-            f"Первый скан будет через {CONFIG['SCAN_INTERVAL_SECONDS']} секунд."
+            f"Сканирование каждые {CONFIG['SCAN_INTERVAL_SECONDS']} секунд."
         )
         send_telegram_message(intro, chat_id=chat_id, html=True, reply_markup=kb)
-    elif first_token in ("/help", "ℹ️ помощь"):
+        return
+
+    if first_token in ("/help",) or lower == "ℹ️ помощь":
         msg_text = (
             "<b>ℹ️ Описание логики бота</b>\n\n"
             "• Основной таймфрейм: 5m\n"
             "• Подтверждение тренда: 15m\n"
             "• Фильтры: EMA200, RSI(14), StochRSI, MACD\n"
-            "• Волатильность: ATR-фильтр по 5m свече\n"
-            "• Контекст: BTCUSDT (тренд, RSI, 24h изменение)\n"
-            "• Фильтрация по 24h объёму и дневному лимиту сигналов\n\n"
+            "• Волатильность: ATR-фильтр\n"
+            "• Контекст: BTCUSDT (EMA200, RSI, 24h изменение)\n"
+            "• Фильтрация по 24h объёму + лимиты сигналов\n\n"
             "Сигналы не являются финансовой рекомендацией. Торгуйте на свой риск."
         )
         send_telegram_message(msg_text, chat_id=chat_id, html=True, reply_markup=kb)
-    elif first_token in ("/stop", "📴 стоп"):
+        return
+
+    if first_token in ("/stop",) or lower == "📴 стоп":
         db_unsubscribe(chat_id)
         send_telegram_message(
-            "Вы отписались от сигналов. В любой момент можете вернуться с помощью команды /start.",
+            "Вы отписались от сигналов. В любой момент можете вернуться с помощью /start.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
         )
-    elif first_token in ("/status", "📊 статус"):
-        risk_off_state = "активен" if (STATE and STATE.is_risk_off()) else "выключен"
+        return
+
+    if first_token in ("/status",) or lower == "📊 статус":
+        risk_off_state = "активен" if STATE.is_risk_off() else "выключен"
         msg_lines = [
             "<b>📊 Статус торгового бота</b>",
             "",
@@ -712,46 +823,34 @@ def handle_command(update: Dict[str, Any]) -> None:
             f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%",
             f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             "",
+            f"🛑 Risk OFF: {risk_off_state}",
         ]
         if is_admin:
-            subs_count = db_get_subscribers_count()
-            msg_lines.append(f"👥 Подписчиков: {subs_count}")
-            if STATE:
-                msg_lines.append(
-                    f"📌 Сигналы сегодня: "
-                    f"{STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}"
-                )
-        else:
-            msg_lines.append("👤 Вы подписаны на сигналы этого бота.")
-        msg_lines.append(f"🛑 Режим Risk OFF: {risk_off_state}")
-        if FOMC_DATES_UTC:
-            msg_lines.append("📅 FOMC-окна: настроены (бот не сканирует ±1 час).")
-        else:
-            msg_lines.append("📅 FOMC-окна: не заданы (список дат пуст).")
-        msg = "\n".join(msg_lines)
-        send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
-    elif first_token == "/settings" or lower.startswith("⚙️ настройки"):
+            msg_lines.append(f"👥 Подписчиков: {db_get_subscribers_count()}")
+            msg_lines.append(f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}")
+        msg_lines.append("📅 FOMC-окна: настроены (±1 час)." if FOMC_DATES_UTC else "📅 FOMC-окна: не заданы.")
+        send_telegram_message("\n".join(msg_lines), chat_id=chat_id, html=True, reply_markup=kb)
+        return
+
+    # Admin panel open
+    if (lower == "🛠 админ" or first_token == "/admin") and is_admin:
+        send_telegram_message(
+            admin_status_text(),
+            chat_id=chat_id,
+            html=True,
+            reply_markup=admin_inline_panel(),
+        )
+        return
+
+    if first_token == "/settings" or lower.startswith("⚙️ настройки"):
         if not is_admin:
-            send_telegram_message(
-                "⛔ Эта команда доступна только администратору.",
-                chat_id=chat_id,
-                html=False,
-                reply_markup=kb,
-            )
+            send_telegram_message("⛔ Эта команда доступна только администратору.", chat_id=chat_id, reply_markup=kb)
             return
-        parts = text.split()
+
         if len(parts) == 1:
-            msg = (
-                "<b>⚙️ Текущие настройки</b>\n\n"
-                f"• MIN_QUOTE_VOLUME: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT\n"
-                f"• MAX_SIGNALS_PER_DAY: {CONFIG['MAX_SIGNALS_PER_DAY']}\n"
-                f"• SCAN_INTERVAL_SECONDS: {CONFIG['SCAN_INTERVAL_SECONDS']} сек\n"
-                f"• MIN_ATR_PCT: {CONFIG['MIN_ATR_PCT']}%\n\n"
-                "Чтобы изменить, используйте формат:\n"
-                "<code>/settings volume=70000000 max_signals=5 interval=900 atr=0.05</code>"
-            )
-            send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
+            send_telegram_message(admin_cfg_text(), chat_id=chat_id, html=True, reply_markup=kb)
             return
+
         changes: List[str] = []
         for token in parts[1:]:
             if "=" not in token:
@@ -759,134 +858,99 @@ def handle_command(update: Dict[str, Any]) -> None:
             key, val = token.split("=", 1)
             key = key.strip().lower()
             val = val.strip()
+
             if key in ("volume", "min_volume"):
                 try:
-                    ival = int(val)
+                    CONFIG["MIN_QUOTE_VOLUME"] = int(val)
+                    changes.append(f"MIN_QUOTE_VOLUME → {CONFIG['MIN_QUOTE_VOLUME']:,}")
                 except ValueError:
-                    continue
-                CONFIG["MIN_QUOTE_VOLUME"] = ival
-                changes.append(f"MIN_QUOTE_VOLUME → {ival:,}")
+                    pass
+
             elif key in ("max_signals", "max_per_day"):
                 try:
-                    ival = int(val)
+                    CONFIG["MAX_SIGNALS_PER_DAY"] = int(val)
+                    changes.append(f"MAX_SIGNALS_PER_DAY → {CONFIG['MAX_SIGNALS_PER_DAY']}")
                 except ValueError:
-                    continue
-                CONFIG["MAX_SIGNALS_PER_DAY"] = ival
-                changes.append(f"MAX_SIGNALS_PER_DAY → {ival}")
+                    pass
+
             elif key in ("interval", "scan_interval"):
                 try:
-                    ival = int(val)
+                    CONFIG["SCAN_INTERVAL_SECONDS"] = int(val)
+                    changes.append(f"SCAN_INTERVAL_SECONDS → {CONFIG['SCAN_INTERVAL_SECONDS']} сек")
                 except ValueError:
-                    continue
-                CONFIG["SCAN_INTERVAL_SECONDS"] = ival
-                changes.append(f"SCAN_INTERVAL_SECONDS → {ival} сек")
+                    pass
+
             elif key in ("atr", "atr_min", "atrmin"):
                 try:
-                    fval = float(val)
+                    CONFIG["MIN_ATR_PCT"] = float(val)
+                    changes.append(f"MIN_ATR_PCT → {CONFIG['MIN_ATR_PCT']}%")
                 except ValueError:
-                    continue
-                CONFIG["MIN_ATR_PCT"] = fval
-                changes.append(f"MIN_ATR_PCT → {fval}%")
+                    pass
+
         if not changes:
-            msg = (
-                "Не удалось разобрать параметры.\n"
-                "Пример: <code>/settings volume=70000000 max_signals=5 interval=900 atr=0.05</code>"
-            )
-            send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
-        else:
-            msg = "<b>⚙️ Обновлённые настройки:</b>\n" + "\n".join(
-                f"• {c}" for c in changes
-            )
-            send_telegram_message(msg, chat_id=chat_id, html=True, reply_markup=kb)
-    elif first_token == "/risk_off":
-        if not is_admin:
             send_telegram_message(
-                "⛔ Эта команда доступна только администратору.",
+                "Не удалось разобрать параметры.\nПример: <code>/settings volume=70000000 max_signals=7 interval=900 atr=0.05</code>",
                 chat_id=chat_id,
-                html=False,
+                html=True,
                 reply_markup=kb,
             )
+        else:
+            send_telegram_message(
+                "<b>⚙️ Обновлённые настройки:</b>\n" + "\n".join(f"• {c}" for c in changes),
+                chat_id=chat_id,
+                html=True,
+                reply_markup=kb,
+            )
+        return
+
+    if first_token == "/risk_off":
+        if not is_admin:
+            send_telegram_message("⛔ Только администратор.", chat_id=chat_id, reply_markup=kb)
             return
         STATE.set_risk_off(True)
-        send_telegram_message(
-            "Режим <b>Risk OFF</b> включён. Новые сигналы сканироваться не будут.",
-            chat_id=chat_id,
-            html=True,
-            reply_markup=kb,
-        )
-    elif first_token == "/risk_on":
+        send_telegram_message("Режим <b>Risk OFF</b> включён.", chat_id=chat_id, html=True, reply_markup=kb)
+        return
+
+    if first_token == "/risk_on":
         if not is_admin:
-            send_telegram_message(
-                "⛔ Эта команда доступна только администратору.",
-                chat_id=chat_id,
-                html=False,
-                reply_markup=kb,
-            )
+            send_telegram_message("⛔ Только администратор.", chat_id=chat_id, reply_markup=kb)
             return
         STATE.set_risk_off(False)
+        send_telegram_message("Режим <b>Risk OFF</b> выключен.", chat_id=chat_id, html=True, reply_markup=kb)
+        return
+
+    # fallback
+    if chat_id:
         send_telegram_message(
-            "Режим <b>Risk OFF</b> выключен. Сигналы снова будут сканироваться.",
+            "Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
             chat_id=chat_id,
-            html=True,
             reply_markup=kb,
         )
-    else:
-        msg = (
-            "Я пока не понимаю эту команду.\n"
-            "Используйте кнопки под полем ввода или /help."
-        )
-        send_telegram_message(msg, chat_id=chat_id, html=False, reply_markup=kb)
 
+# =========================
+# POLLING (non-blocking + scan scheduler)
+# =========================
 
-def telegram_polling_loop() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN не задан. Завершение.")
-        return
-    last_update_id = None
-    logging.info("Запуск Telegram bot polling...")
-    while True:
-        params: Dict[str, Any] = {"timeout": 25}
-        if last_update_id is not None:
-            params["offset"] = last_update_id + 1
-        try:
-            url = f"{TELEGRAM_API_URL}/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            resp = requests.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logging.error("Ошибка получения обновлений: %s", e)
-            time.sleep(5)
-            continue
-        if not data.get("ok"):
-            time.sleep(2)
-            continue
-        for upd in data.get("result", []):
-            last_update_id = upd.get("update_id", last_update_id)
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
-                continue
-            text = msg.get("text", "") or ""
-            chat_id = str(msg.get("chat", {}).get("id"))
-            lower = text.lower()
-            if text.startswith("/"):
-                handle_command(upd)
-            elif lower in (
-                "🚀 старт",
-                "📊 статус",
-                "ℹ️ помощь",
-                "📴 стоп",
-                "⚙️ настройки",
-            ):
-                handle_command(upd)
-            else:
-                send_telegram_message(
-                    "Я пока не понимаю эту команду.\n"
-                    "Пожалуйста, используйте кнопки под полем ввода или /help.",
-                    chat_id=chat_id,
-                    html=False,
-                    reply_markup=get_reply_keyboard(chat_id),
-                )
+def get_updates(offset: Optional[int]) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    params: Dict[str, Any] = {"timeout": 25}
+    if offset is not None:
+        params["offset"] = offset
+    url = f"{TELEGRAM_API_URL}/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    resp = requests.get(url, params=params, timeout=35)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        return [], offset
 
+    updates = data.get("result", []) or []
+    new_offset = offset
+    for upd in updates:
+        uid = upd.get("update_id")
+        if isinstance(uid, int):
+            next_off = uid + 1
+            if new_offset is None or next_off > new_offset:
+                new_offset = next_off
+    return updates, new_offset
 
 def main_loop() -> None:
     if not TELEGRAM_BOT_TOKEN:
@@ -896,7 +960,7 @@ def main_loop() -> None:
     db_ensure_tables()
 
     logging.info("=" * 60)
-    logging.info("Запуск Binance Futures Signal Bot")
+    logging.info("Запуск Binance Futures Signal Bot (FIXED + ADMIN PANEL)")
     logging.info("=" * 60)
     logging.info("Конфигурация:")
     logging.info("  - Минимальный объём: %s USDT", f"{CONFIG['MIN_QUOTE_VOLUME']:,}")
@@ -908,12 +972,9 @@ def main_loop() -> None:
     logging.info("  - Мин. ATR: %.3f%%", CONFIG["MIN_ATR_PCT"])
     logging.info("  - Макс. сигналов за скан: %d", CONFIG["MAX_SIGNALS_PER_SCAN"])
     logging.info("  - BTC фильтр: %s", "ON" if CONFIG["BTC_FILTER_ENABLED"] else "OFF")
-    if not FOMC_DATES_UTC:
-        logging.info("  - FOMC-окна: не настроены (список дат пуст).")
-    else:
-        logging.info("  - FOMC-окна: %d дат.", len(FOMC_DATES_UTC))
 
     last_scan_ts = 0.0
+    offset: Optional[int] = None
 
     def handle_sigterm(signum, frame):
         logging.info("Получен сигнал остановки. Завершение работы...")
@@ -923,7 +984,38 @@ def main_loop() -> None:
     signal.signal(signal.SIGINT, handle_sigterm)
 
     while True:
-        telegram_polling_loop()
+        # 1) Telegram polling (messages + callbacks)
+        try:
+            updates, offset = get_updates(offset)
+            for upd in updates:
+                if upd.get("callback_query"):
+                    handle_callback_query_update(upd)
+                    continue
+
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+
+                text = (msg.get("text", "") or "").strip()
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+
+                lower = text.lower().strip()
+                if text.startswith("/"):
+                    handle_command(upd)
+                elif lower in ("🚀 старт", "📊 статус", "ℹ️ помощь", "📴 стоп", "⚙️ настройки", "🛠 админ"):
+                    handle_command(upd)
+                else:
+                    if chat_id:
+                        send_telegram_message(
+                            "Я пока не понимаю эту команду.\nПожалуйста, используйте кнопки или /help.",
+                            chat_id=chat_id,
+                            reply_markup=get_reply_keyboard(chat_id),
+                        )
+        except Exception as e:
+            logging.error("Ошибка polling: %s", e)
+            time.sleep(3)
+
+        # 2) Market scan scheduler
         now = time.time()
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
@@ -932,11 +1024,7 @@ def main_loop() -> None:
             except Exception as e:
                 logging.error("Ошибка при сканировании рынка: %s", e)
             last_scan_ts = time.time()
-            logging.info(
-                "Ожидание %d секунд до следующего сканирования...",
-                CONFIG["SCAN_INTERVAL_SECONDS"],
-            )
-
+            logging.info("Ожидание %d секунд до следующего сканирования...", CONFIG["SCAN_INTERVAL_SECONDS"])
 
 if __name__ == "__main__":
     try:
