@@ -1093,5 +1093,5 @@ if __name__ == "__main__":
         main_loop()
     except SystemExit:
         logging.info("Бот остановлен.")
-    except Exception as e:
-        logging.error("Критическая ошибка: %s", e)
+    except Exception:
+        logging.exception("Критическая ошибка")
