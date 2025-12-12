@@ -30,16 +30,20 @@ CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
     "SCAN_INTERVAL_SECONDS": 600,
-    "MAX_SIGNALS_PER_DAY": 7,
+    "MAX_SIGNALS_PER_DAY": 10,
     "MIN_QUOTE_VOLUME": 50_000_000,
-    "RISK_REWARD": 1.7,
+    "RISK_REWARD": 2.0,
     "MIN_ATR_PCT": 0.05,
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.15,
-    "MAX_STOP_PCT": 0.80,
-    "MAX_SIGNALS_PER_SCAN": 1,
-    "SYMBOL_COOLDOWN_SECONDS": 1800,
+    "MIN_STOP_PCT": 0.12,
+    "MAX_STOP_PCT": 1.20,
+    "STOP_BUFFER_LONG": 0.25,
+    "STOP_BUFFER_SHORT": 0.25,
+    "TP_EXTRA_PCT": 0.15,
+    "MAX_SIGNALS_PER_SCAN": 3,
+    "SYMBOL_COOLDOWN_SECONDS": 600,
     "BTC_FILTER_ENABLED": True,
+    "DEBUG_REASONS": False,
 }
 
 
@@ -649,29 +653,35 @@ def analyse_symbol(
         )
         return None
 
-    price_above = close > ema * 1.001
-    price_below = close < ema * 0.999
+    price_above = close > ema * 1.0002
+    price_below = close < ema * 0.9998
 
     side: Optional[str] = None
-    if price_above and rsi > 50 and macd_val > macd_signal and stoch_val > 20:
+    if price_above and rsi > 46 and macd_val >= macd_signal and stoch_val > 5:
         side = "long"
-    elif price_below and rsi < 50 and macd_val < macd_signal and stoch_val < 80:
+    elif price_below and rsi < 54 and macd_val <= macd_signal and stoch_val < 95:
         side = "short"
 
     if side is None:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s: нет направления (EMA/RSI/MACD/Stoch не совпали). close=%.6f ema200=%.6f rsi=%.1f macd=%.5f sig=%.5f stoch=%.1f",
+                         symbol, close, ema, rsi, macd_val, macd_signal, stoch_val)
         return None
 
     if CONFIG["BTC_FILTER_ENABLED"]:
+        # облегчённый BTC-фильтр, чтобы сигналов было больше (5m-логика сохраняется)
         btc_price = btc_ctx["price"]
         btc_ema = btc_ctx["ema200"]
         btc_rsi = btc_ctx["rsi"]
         btc_change = btc_ctx["change_pct"]
+
+        # жёстко режем только "опасные" режимы
         if side == "long":
-            if btc_price < btc_ema or btc_rsi < 45 or btc_change < -3.0:
+            if btc_price < btc_ema * 0.996 or btc_rsi < 38 or btc_change < -6.0:
                 logging.info("%s отклонён по BTC-фильтру для long.", symbol)
                 return None
         else:
-            if btc_price > btc_ema or btc_rsi > 55 or btc_change > 3.0:
+            if btc_price > btc_ema * 1.004 or btc_rsi > 62 or btc_change > 6.0:
                 logging.info("%s отклонён по BTC-фильтру для short.", symbol)
                 return None
 
@@ -681,20 +691,33 @@ def analyse_symbol(
     impulse_high = h5[impulse_idx]
     impulse_time = datetime.fromtimestamp(t5[impulse_idx] / 1000, timezone.utc)
 
+    # исправление: стоп не должен оказаться "выше входа" для long (и наоборот для short)
+    swing_lookback = 4  # последние 4 свечи (включая импульсную и текущую)
+    swing_low = min(l5[-swing_lookback:])
+    swing_high = max(h5[-swing_lookback:])
+    buf_long = float(CONFIG.get("STOP_BUFFER_LONG", 0.20)) / 100.0
+    buf_short = float(CONFIG.get("STOP_BUFFER_SHORT", 0.20)) / 100.0
+    tp_extra = 1.0 + float(CONFIG.get("TP_EXTRA_PCT", 0.10)) / 100.0
+
     if side == "long":
-        stop_loss = impulse_low * 0.999
+        stop_loss = swing_low * (1.0 - buf_long)
+        if stop_loss >= close:
+            return None
         stop_pct = abs((close - stop_loss) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             return None
-        take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"]
+        take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"] * tp_extra
     else:
-        stop_loss = impulse_high * 1.001
+        stop_loss = swing_high * (1.0 + buf_short)
+        if stop_loss <= close:
+            return None
         stop_pct = abs((stop_loss - close) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             return None
-        take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"]
+        take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
 
-    leverage = 20 if side == "short" else 20
+    leverage = 20
+
 
     # проценты для статистики
     if side == "long":
@@ -779,7 +802,6 @@ def scan_market_and_send_signals() -> int:
         STATE.signals_sent_today,
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
-    return signals_for_scan
     return signals_for_scan
 
 
@@ -1024,8 +1046,10 @@ def main_loop() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
+    # запускаем Telegram polling в отдельном потоке, иначе сканирование никогда не запускается
+    threading.Thread(target=telegram_polling_loop, daemon=True).start()
+
     while True:
-        telegram_polling_loop()
         now = time.time()
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
@@ -1034,10 +1058,7 @@ def main_loop() -> None:
             except Exception as e:
                 logging.error("Ошибка при сканировании рынка: %s", e)
             last_scan_ts = time.time()
-            logging.info(
-                "Ожидание %d секунд до следующего сканирования...",
-                CONFIG["SCAN_INTERVAL_SECONDS"],
-            )
+        time.sleep(1)
 
 
 if __name__ == "__main__":
