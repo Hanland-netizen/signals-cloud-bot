@@ -36,7 +36,7 @@ CONFIG: Dict[str, Any] = {
     "MAX_SIGNALS_PER_DAY": 10,
     "MIN_QUOTE_VOLUME": 50_000_000,
     "RISK_REWARD": 1.7,
-    "MIN_ATR_PCT": 0.05,
+    "MIN_ATR_PCT": 0.15,
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.15,
     "MAX_STOP_PCT": 0.80,
@@ -44,6 +44,8 @@ CONFIG: Dict[str, Any] = {
     "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
     "SYMBOL_COOLDOWN_SECONDS": 3600,
     "BTC_FILTER_ENABLED": True,
+    "EXCLUDED_SYMBOLS": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
+
 }
 
 
@@ -749,6 +751,8 @@ def scan_market_and_send_signals() -> int:
         return 0
     signals_for_scan = 0
     for symbol in symbols:
+        if symbol in CONFIG.get("EXCLUDED_SYMBOLS", []):
+            continue
         if signals_for_scan >= CONFIG["MAX_SIGNALS_PER_SCAN"]:
             break
         if not STATE.can_send_signal(symbol):
@@ -861,6 +865,7 @@ def handle_command(update: Dict[str, Any]) -> None:
             f"🎯 Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
             f"📈 Multi-TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
             f"💹 Фильтр BTC: {'включён' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}",
+            
             f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%",
             f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             f"🛑 Risk OFF: {risk_off_state}",
