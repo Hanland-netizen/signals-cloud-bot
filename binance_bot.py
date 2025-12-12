@@ -1,5 +1,3 @@
-import sys
-
 import os
 import time
 import math
@@ -17,7 +15,6 @@ from psycopg2.extras import RealDictCursor
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]  # <-- важно
 )
 
 BINANCE_FAPI_URL = "https://fapi.binance.com"
@@ -33,19 +30,15 @@ CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
     "SCAN_INTERVAL_SECONDS": 600,
-    "MAX_SIGNALS_PER_DAY": 10,
+    "MAX_SIGNALS_PER_DAY": 7,
     "MIN_QUOTE_VOLUME": 50_000_000,
-    "RISK_REWARD": 1.9,
+    "RISK_REWARD": 1.7,
     "MIN_ATR_PCT": 0.05,
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.15,
     "MAX_STOP_PCT": 0.80,
-    "STOP_BUFFER_LONG": 0.20,
-    "STOP_BUFFER_SHORT": 0.20,
-    "TP_EXTRA_PCT": 0.10,
     "MAX_SIGNALS_PER_SCAN": 1,
-    "SYMBOL_COOLDOWN_SECONDS": 3600,
-    "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
+    "SYMBOL_COOLDOWN_SECONDS": 1800,
     "BTC_FILTER_ENABLED": True,
 }
 
@@ -56,7 +49,6 @@ class SignalState:
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
         self.symbol_last_signal_ts: Dict[str, float] = {}
-        self.last_any_signal_ts: float = 0.0
         self.risk_off: bool = False
 
     def reset_if_new_day(self) -> None:
@@ -71,9 +63,6 @@ class SignalState:
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
         now = time.time()
-        # global cooldown between any two signals (to avoid bursts)
-        if self.last_any_signal_ts and (now - self.last_any_signal_ts) < CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0):
-            return False
         last_ts = self.symbol_last_signal_ts.get(symbol)
         if (
             last_ts is not None
@@ -87,7 +76,6 @@ class SignalState:
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
 
-        self.last_any_signal_ts = self.symbol_last_signal_ts[symbol]
     def is_risk_off(self) -> bool:
         return self.risk_off
 
@@ -661,32 +649,29 @@ def analyse_symbol(
         )
         return None
 
-    price_above = close > ema * 1.0005
-    price_below = close < ema * 0.9995
+    price_above = close > ema * 1.001
+    price_below = close < ema * 0.999
 
     side: Optional[str] = None
-    if price_above and rsi > 48 and macd_val >= macd_signal and stoch_val > 10:
+    if price_above and rsi > 50 and macd_val > macd_signal and stoch_val > 20:
         side = "long"
-    elif price_below and rsi < 52 and macd_val <= macd_signal and stoch_val < 90:
+    elif price_below and rsi < 50 and macd_val < macd_signal and stoch_val < 80:
         side = "short"
 
     if side is None:
         return None
 
     if CONFIG["BTC_FILTER_ENABLED"]:
-        # облегчённый BTC-фильтр, чтобы сигналов было больше (5m-логика сохраняется)
         btc_price = btc_ctx["price"]
         btc_ema = btc_ctx["ema200"]
         btc_rsi = btc_ctx["rsi"]
         btc_change = btc_ctx["change_pct"]
-
-        # жёстко режем только "опасные" режимы
         if side == "long":
-            if btc_price < btc_ema * 0.997 or btc_rsi < 40 or btc_change < -5.0:
+            if btc_price < btc_ema or btc_rsi < 45 or btc_change < -3.0:
                 logging.info("%s отклонён по BTC-фильтру для long.", symbol)
                 return None
         else:
-            if btc_price > btc_ema * 1.003 or btc_rsi > 60 or btc_change > 5.0:
+            if btc_price > btc_ema or btc_rsi > 55 or btc_change > 3.0:
                 logging.info("%s отклонён по BTC-фильтру для short.", symbol)
                 return None
 
@@ -696,33 +681,20 @@ def analyse_symbol(
     impulse_high = h5[impulse_idx]
     impulse_time = datetime.fromtimestamp(t5[impulse_idx] / 1000, timezone.utc)
 
-    # исправление: стоп не должен оказаться "выше входа" для long (и наоборот для short)
-    swing_lookback = 4  # последние 4 свечи (включая импульсную и текущую)
-    swing_low = min(l5[-swing_lookback:])
-    swing_high = max(h5[-swing_lookback:])
-    buf_long = float(CONFIG.get("STOP_BUFFER_LONG", 0.20)) / 100.0
-    buf_short = float(CONFIG.get("STOP_BUFFER_SHORT", 0.20)) / 100.0
-    tp_extra = 1.0 + float(CONFIG.get("TP_EXTRA_PCT", 0.10)) / 100.0
-
     if side == "long":
-        stop_loss = swing_low * (1.0 - buf_long)
-        if stop_loss >= close:
-            return None
+        stop_loss = impulse_low * 0.999
         stop_pct = abs((close - stop_loss) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             return None
-        take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"] * tp_extra
+        take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"]
     else:
-        stop_loss = swing_high * (1.0 + buf_short)
-        if stop_loss <= close:
-            return None
+        stop_loss = impulse_high * 1.001
         stop_pct = abs((stop_loss - close) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             return None
-        take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
+        take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"]
 
-    leverage = 20
-
+    leverage = 20 if side == "short" else 20
 
     # проценты для статистики
     if side == "long":
@@ -792,8 +764,6 @@ def scan_market_and_send_signals() -> int:
         for cid in active_subs:
             send_telegram_message(text, chat_id=str(cid), html=True)
         STATE.register_signal(symbol)
-        STATE.last_any_signal_ts = time.time()   # ⬅️ ВАЖНО
-
         signals_for_scan += 1
         try:
             db_log_signal(idea, sent_to=len(active_subs))
@@ -810,28 +780,7 @@ def scan_market_and_send_signals() -> int:
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
     return signals_for_scan
-
-
-def normalize_command(text: str) -> str:
-    """Normalise user input from Telegram buttons/messages.
-
-    Removes common emoji prefixes and collapses whitespace so that
-    '🚀  Старт' and 'Старт' are treated the same.
-    """
-    if not text:
-        return ""
-    t = text.strip()
-
-    # Remove common emoji/icons used in our keyboards.
-    for ch in [
-        "🚀","📊","ℹ️","📴","🆔","🛠","⚙️","🛑","✅","🧪","📈","🔧","🔍","📌",
-        "📉","💡","💰","⚠️","❗","✔️","✖️","🟢","🔴","🟡"
-    ]:
-        t = t.replace(ch, " ")
-
-    # Collapse whitespace
-    t = " ".join(t.split())
-    return t
+    return signals_for_scan
 
 
 def handle_command(update: Dict[str, Any]) -> None:
@@ -1019,17 +968,9 @@ def telegram_polling_loop() -> None:
             msg = upd.get("message") or upd.get("edited_message")
             if not msg:
                 continue
-           
-                handle_command(upd)
-            else:
-                send_telegram_message(
-                    "Я пока не понимаю эту команду.\n"
-                    "Пожалуйста, используйте кнопки под полем ввода или /help.",
-                    chat_id=chat_id,
-                    html=False,
-                    reply_markup=get_reply_keyboard(chat_id),
-                )
-
+            # ВАЖНО: пропускаем ВСЕ входящие сообщения в общий обработчик,
+            # иначе часть кнопок (Админ/Статистика/Мой ID) никогда не сработает.
+            handle_command(upd)
 
 def main_loop() -> None:
     if not TELEGRAM_BOT_TOKEN:
@@ -1064,15 +1005,9 @@ def main_loop() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    # запускаем Telegram polling в отдельном потоке, иначе сканирование никогда не запускается
-    threading.Thread(target=telegram_polling_loop, daemon=True).start()
-
     while True:
+        telegram_polling_loop()
         now = time.time()
-        # global cooldown between any two signals (to avoid bursts)
-        if STATE.last_any_signal_ts and (now - STATE.last_any_signal_ts) < CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0):
-            time.sleep(1)
-            continue
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
             try:
@@ -1080,7 +1015,10 @@ def main_loop() -> None:
             except Exception as e:
                 logging.error("Ошибка при сканировании рынка: %s", e)
             last_scan_ts = time.time()
-        time.sleep(1)
+            logging.info(
+                "Ожидание %d секунд до следующего сканирования...",
+                CONFIG["SCAN_INTERVAL_SECONDS"],
+            )
 
 
 if __name__ == "__main__":
@@ -1088,5 +1026,5 @@ if __name__ == "__main__":
         main_loop()
     except SystemExit:
         logging.info("Бот остановлен.")
-    except Exception:
-        logging.exception("Критическая ошибка")
+    except Exception as e:
+        logging.error("Критическая ошибка: %s", e)
