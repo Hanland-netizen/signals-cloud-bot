@@ -40,8 +40,9 @@ CONFIG: Dict[str, Any] = {
     "STOP_BUFFER_LONG": 0.20,
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.10,
-    "MAX_SIGNALS_PER_SCAN": 2,
+    "MAX_SIGNALS_PER_SCAN": 1,
     "SYMBOL_COOLDOWN_SECONDS": 900,
+    "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
     "BTC_FILTER_ENABLED": True,
 }
 
@@ -52,6 +53,7 @@ class SignalState:
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
         self.symbol_last_signal_ts: Dict[str, float] = {}
+        self.last_any_signal_ts: float = 0.0
         self.risk_off: bool = False
 
     def reset_if_new_day(self) -> None:
@@ -66,6 +68,9 @@ class SignalState:
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
         now = time.time()
+        # global cooldown between any two signals (to avoid bursts)
+        if self.last_any_signal_ts and (now - self.last_any_signal_ts) < CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0):
+            return False
         last_ts = self.symbol_last_signal_ts.get(symbol)
         if (
             last_ts is not None
@@ -79,6 +84,7 @@ class SignalState:
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
 
+        self.last_any_signal_ts = self.symbol_last_signal_ts[symbol]
     def is_risk_off(self) -> bool:
         return self.risk_off
 
@@ -1069,6 +1075,9 @@ def main_loop() -> None:
 
     while True:
         now = time.time()
+        # global cooldown between any two signals (to avoid bursts)
+        if self.last_any_signal_ts and (now - self.last_any_signal_ts) < CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0):
+            return False
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
             try:
