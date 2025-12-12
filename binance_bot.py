@@ -32,18 +32,17 @@ CONFIG: Dict[str, Any] = {
     "SCAN_INTERVAL_SECONDS": 600,
     "MAX_SIGNALS_PER_DAY": 10,
     "MIN_QUOTE_VOLUME": 50_000_000,
-    "RISK_REWARD": 2.0,
+    "RISK_REWARD": 1.9,
     "MIN_ATR_PCT": 0.05,
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.12,
-    "MAX_STOP_PCT": 1.20,
-    "STOP_BUFFER_LONG": 0.25,
-    "STOP_BUFFER_SHORT": 0.25,
-    "TP_EXTRA_PCT": 0.15,
-    "MAX_SIGNALS_PER_SCAN": 3,
-    "SYMBOL_COOLDOWN_SECONDS": 600,
+    "MIN_STOP_PCT": 0.15,
+    "MAX_STOP_PCT": 0.80,
+    "STOP_BUFFER_LONG": 0.20,
+    "STOP_BUFFER_SHORT": 0.20,
+    "TP_EXTRA_PCT": 0.10,
+    "MAX_SIGNALS_PER_SCAN": 2,
+    "SYMBOL_COOLDOWN_SECONDS": 900,
     "BTC_FILTER_ENABLED": True,
-    "DEBUG_REASONS": False,
 }
 
 
@@ -653,19 +652,16 @@ def analyse_symbol(
         )
         return None
 
-    price_above = close > ema * 1.0002
-    price_below = close < ema * 0.9998
+    price_above = close > ema * 1.0005
+    price_below = close < ema * 0.9995
 
     side: Optional[str] = None
-    if price_above and rsi > 46 and macd_val >= macd_signal and stoch_val > 5:
+    if price_above and rsi > 48 and macd_val >= macd_signal and stoch_val > 10:
         side = "long"
-    elif price_below and rsi < 54 and macd_val <= macd_signal and stoch_val < 95:
+    elif price_below and rsi < 52 and macd_val <= macd_signal and stoch_val < 90:
         side = "short"
 
     if side is None:
-        if CONFIG.get("DEBUG_REASONS"):
-            logging.info("%s: нет направления (EMA/RSI/MACD/Stoch не совпали). close=%.6f ema200=%.6f rsi=%.1f macd=%.5f sig=%.5f stoch=%.1f",
-                         symbol, close, ema, rsi, macd_val, macd_signal, stoch_val)
         return None
 
     if CONFIG["BTC_FILTER_ENABLED"]:
@@ -677,11 +673,11 @@ def analyse_symbol(
 
         # жёстко режем только "опасные" режимы
         if side == "long":
-            if btc_price < btc_ema * 0.996 or btc_rsi < 38 or btc_change < -6.0:
+            if btc_price < btc_ema * 0.997 or btc_rsi < 40 or btc_change < -5.0:
                 logging.info("%s отклонён по BTC-фильтру для long.", symbol)
                 return None
         else:
-            if btc_price > btc_ema * 1.004 or btc_rsi > 62 or btc_change > 6.0:
+            if btc_price > btc_ema * 1.003 or btc_rsi > 60 or btc_change > 5.0:
                 logging.info("%s отклонён по BTC-фильтру для short.", symbol)
                 return None
 
@@ -803,6 +799,28 @@ def scan_market_and_send_signals() -> int:
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
     return signals_for_scan
+
+
+def normalize_command(text: str) -> str:
+    """Normalise user input from Telegram buttons/messages.
+
+    Removes common emoji prefixes and collapses whitespace so that
+    '🚀  Старт' and 'Старт' are treated the same.
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    # Remove common emoji/icons used in our keyboards.
+    for ch in [
+        "🚀","📊","ℹ️","📴","🆔","🛠","⚙️","🛑","✅","🧪","📈","🔧","🔍","📌",
+        "📉","💡","💰","⚠️","❗","✔️","✖️","🟢","🔴","🟡"
+    ]:
+        t = t.replace(ch, " ")
+
+    # Collapse whitespace
+    t = " ".join(t.split())
+    return t
 
 
 def handle_command(update: Dict[str, Any]) -> None:
