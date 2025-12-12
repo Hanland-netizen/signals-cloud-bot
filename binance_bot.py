@@ -39,11 +39,11 @@ CONFIG: Dict[str, Any] = {
     "MIN_ATR_PCT": 0.15,
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.15,
-    "MAX_STOP_PCT": 3.00,
+    "MAX_STOP_PCT": 2.50,
     "MAX_SIGNALS_PER_SCAN": 1,
     "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
     "SYMBOL_COOLDOWN_SECONDS": 3600,
-    "BTC_FILTER_ENABLED": False,
+    "BTC_FILTER_ENABLED": True,
     "EXCLUDED_SYMBOLS": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
 
 }
@@ -564,7 +564,13 @@ def get_btc_context() -> Dict[str, Any]:
         "rsi": rsi,
         "change_pct": change_pct,
     }
-    # BTC context logging removed
+    logging.info(
+        "BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
+        price,
+        ema200,
+        rsi,
+        change_pct,
+    )
     return ctx
 
 
@@ -616,6 +622,8 @@ def build_signal_text(
 def analyse_symbol(
     symbol: str,
     btc_ctx: Dict[str, Any],
+    klines_5m: List[List[Any]],
+    klines_15m: List[List[Any]],
 ) -> Optional[Dict[str, Any]]:
 
     # ❌ полностью исключаем BTC из сигналов
@@ -623,12 +631,9 @@ def analyse_symbol(
         return None
 
 
-    params = {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300}
-    kl_5m = fetch_binance("/fapi/v1/klines", params)
-    o5, h5, l5, c5, t5 = kline_to_floats(kl_5m)
-    params_htf = {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": 200}
-    kl_15m = fetch_binance("/fapi/v1/klines", params_htf)
-    _, _, _, c15, _ = kline_to_floats(kl_15m)
+    # Используем уже переданные klines (чтобы не делать лишние запросы к Binance)
+    o5, h5, l5, c5, t5 = kline_to_floats(klines_5m)
+    _, _, _, c15, _ = kline_to_floats(klines_15m)
 
     ema200_5m = calc_ema(c5, 200)
     ema200_15m = calc_ema(c15, 200)
@@ -740,7 +745,7 @@ def scan_market_and_send_signals() -> int:
     if in_fomc_window(now_utc):
         logging.info("Сейчас окно FOMC, сканирование отключено.")
         return 0
-    btc_ctx = get_btc_context() if CONFIG.get("BTC_FILTER_ENABLED") else {}
+    btc_ctx = get_btc_context()
     symbols = get_usdt_perp_symbols()
     symbols = get_24h_volume_filter(symbols)
     logging.info("Анализ %d символов...", len(symbols))
@@ -757,7 +762,9 @@ def scan_market_and_send_signals() -> int:
             break
         if not STATE.can_send_signal(symbol):
             continue
-        idea = analyse_symbol(symbol, btc_ctx)
+        kl_5m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300})
+        kl_15m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": 200})
+        idea = analyse_symbol(symbol, btc_ctx, kl_5m, kl_15m)
         if not idea:
             continue
         text = build_signal_text(
