@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import math
 import json
@@ -16,7 +17,7 @@ from psycopg2.extras import RealDictCursor
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]  # <-- важно
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 BINANCE_FAPI_URL = "https://fapi.binance.com"
