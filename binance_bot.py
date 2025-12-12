@@ -33,7 +33,7 @@ CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
     "SCAN_INTERVAL_SECONDS": 600,
-    "MAX_SIGNALS_PER_DAY": 7,
+    "MAX_SIGNALS_PER_DAY": 10,
     "MIN_QUOTE_VOLUME": 50_000_000,
     "RISK_REWARD": 1.7,
     "MIN_ATR_PCT": 0.05,
@@ -41,7 +41,8 @@ CONFIG: Dict[str, Any] = {
     "MIN_STOP_PCT": 0.15,
     "MAX_STOP_PCT": 0.80,
     "MAX_SIGNALS_PER_SCAN": 1,
-    "SYMBOL_COOLDOWN_SECONDS": 1800,
+    "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
+    "SYMBOL_COOLDOWN_SECONDS": 3600,
     "BTC_FILTER_ENABLED": True,
 }
 
@@ -52,6 +53,7 @@ class SignalState:
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
         self.symbol_last_signal_ts: Dict[str, float] = {}
+        self.last_any_signal_ts: Optional[float] = None
         self.risk_off: bool = False
 
     def reset_if_new_day(self) -> None:
@@ -66,6 +68,10 @@ class SignalState:
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
         now = time.time()
+        # Global cooldown between ANY signals
+        gcd = float(CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0) or 0)
+        if gcd > 0 and self.last_any_signal_ts is not None and (now - self.last_any_signal_ts) < gcd:
+            return False
         last_ts = self.symbol_last_signal_ts.get(symbol)
         if (
             last_ts is not None
@@ -78,6 +84,7 @@ class SignalState:
         self.signals_sent_today += 1
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
+        self.last_any_signal_ts = self.symbol_last_signal_ts[symbol]
 
     def is_risk_off(self) -> bool:
         return self.risk_off
@@ -783,7 +790,6 @@ def scan_market_and_send_signals() -> int:
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
     return signals_for_scan
-    return signals_for_scan
 
 
 def handle_command(update: Dict[str, Any]) -> None:
@@ -1008,8 +1014,10 @@ def main_loop() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
+        # Start Telegram polling in background thread
+    threading.Thread(target=telegram_polling_loop, daemon=True).start()
+
     while True:
-        telegram_polling_loop()
         now = time.time()
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
@@ -1024,10 +1032,11 @@ def main_loop() -> None:
             )
 
 
+        time.sleep(1)
 if __name__ == "__main__":
     try:
         main_loop()
     except SystemExit:
         logging.info("Бот остановлен.")
-    except Exception as e:
-        logging.error("Критическая ошибка: %s", e)
+    except Exception:
+        logging.exception("Критическая ошибка")
