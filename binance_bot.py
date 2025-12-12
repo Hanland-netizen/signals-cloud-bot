@@ -814,7 +814,7 @@ def scan_market_and_send_signals() -> int:
             break
         if not STATE.can_send_signal(symbol):
             continue
-        ikl_5m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": CONFIG.get("KLINES_LIMIT_5M", 300)})
+        kl_5m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": CONFIG.get("KLINES_LIMIT_5M", 300)})
         kl_15m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": CONFIG.get("KLINES_LIMIT_15M", 200)})
 
         idea = analyse_symbol(symbol, btc_ctx, kl_5m, kl_15m)
