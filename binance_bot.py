@@ -1016,18 +1016,7 @@ def telegram_polling_loop() -> None:
             msg = upd.get("message") or upd.get("edited_message")
             if not msg:
                 continue
-            text = msg.get("text", "") or ""
-            chat_id = str(msg.get("chat", {}).get("id"))
-            lower = text.lower()
-            if text.startswith("/"):
-                handle_command(upd)
-            elif lower in (
-                "🚀 старт",
-                "📊 статус",
-                "ℹ️ помощь",
-                "📴 стоп",
-                "⚙️ настройки",
-            ):
+           
                 handle_command(upd)
             else:
                 send_telegram_message(
