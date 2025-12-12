@@ -41,7 +41,7 @@ CONFIG: Dict[str, Any] = {
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.10,
     "MAX_SIGNALS_PER_SCAN": 1,
-    "SYMBOL_COOLDOWN_SECONDS": 900,
+    "SYMBOL_COOLDOWN_SECONDS": 3600,
     "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
     "BTC_FILTER_ENABLED": True,
 }
@@ -789,6 +789,8 @@ def scan_market_and_send_signals() -> int:
         for cid in active_subs:
             send_telegram_message(text, chat_id=str(cid), html=True)
         STATE.register_signal(symbol)
+        STATE.last_any_signal_ts = time.time()   # ⬅️ ВАЖНО
+
         signals_for_scan += 1
         try:
             db_log_signal(idea, sent_to=len(active_subs))
@@ -1076,8 +1078,9 @@ def main_loop() -> None:
     while True:
         now = time.time()
         # global cooldown between any two signals (to avoid bursts)
-        if self.last_any_signal_ts and (now - self.last_any_signal_ts) < CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0):
-            return False
+        if STATE.last_any_signal_ts and (now - STATE.last_any_signal_ts) < CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0):
+            time.sleep(1)
+            continue
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
             try:
