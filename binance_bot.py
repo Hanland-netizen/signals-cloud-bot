@@ -622,6 +622,14 @@ def build_signal_text(
 def analyse_symbol(
     symbol: str,
     btc_ctx: Dict[str, Any],
+    klines_5m: List[Dict[str, Any]],
+    klines_15m: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+
+    # ❌ полностью исключаем BTC из сигналов
+    if symbol == "BTCUSDT":
+        return None
+
 ) -> Optional[Dict[str, Any]]:
     params = {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300}
     kl_5m = fetch_binance("/fapi/v1/klines", params)
