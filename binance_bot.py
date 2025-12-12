@@ -12,9 +12,11 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]  # <-- важно
 )
 
 BINANCE_FAPI_URL = "https://fapi.binance.com"
