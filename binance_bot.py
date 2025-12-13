@@ -721,9 +721,9 @@ def analyse_symbol(
     impulse_body = abs(impulse_close - impulse_open)
 
     # требования к силе импульса относительно ATR
-    if impulse_range < atr_abs * float(CONFIG.get("IMPULSE_RANGE_ATR_MULT", 1.30)):
+    if impulse_range < atr_abs * float(CONFIG.get("IMPULSE_RANGE_ATR_MULT", 1.20)):
         return None
-    if impulse_body < atr_abs * float(CONFIG.get("IMPULSE_BODY_ATR_MULT", 0.60)):
+    if impulse_body < atr_abs * float(CONFIG.get("IMPULSE_BODY_ATR_MULT", 0.55)):
         return None
 
     # направление импульса должно совпадать с направлением сделки
