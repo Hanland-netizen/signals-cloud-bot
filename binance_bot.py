@@ -1,14 +1,11 @@
-
-print(">>> RUNNING FILE:", __file__)
-
 import os
-import sys
 import time
 import math
 import json
 import logging
 import signal
 import threading
+import re
 from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -16,11 +13,9 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 BINANCE_FAPI_URL = "https://fapi.binance.com"
@@ -35,20 +30,21 @@ FOMC_DATES_UTC: List[datetime] = []
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
-    "SCAN_INTERVAL_SECONDS": 600,
+    "SCAN_INTERVAL_SECONDS": 300,  # 5 минут
     "MAX_SIGNALS_PER_DAY": 10,
-    "MIN_QUOTE_VOLUME": 50_000_000,
-    "RISK_REWARD": 1.7,
-    "MIN_ATR_PCT": 0.15,
+    "MIN_QUOTE_VOLUME": 20_000_000,  # Снижено с 50M для большего количества сигналов
+    "RISK_REWARD": 1.7,  # Оптимально 1.7-1.9
+    "MIN_ATR_PCT": 0.15,  # Согласно промпту
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.15,
-    "MAX_STOP_PCT": 0.80,
-    "MAX_SIGNALS_PER_SCAN": 1,
-    "GLOBAL_SIGNAL_COOLDOWN_SECONDS": 2400,
-    "SYMBOL_COOLDOWN_SECONDS": 3600,
+    "MIN_STOP_PCT": 0.15,  # Согласно промпту
+    "MAX_STOP_PCT": 1.20,  # Увеличено для меньшего количества ложных отказов
+    "STOP_BUFFER_LONG": 0.20,  # Оптимально для tight-risk
+    "STOP_BUFFER_SHORT": 0.20,
+    "TP_EXTRA_PCT": 0.15,
+    "MAX_SIGNALS_PER_SCAN": 2,
+    "SYMBOL_COOLDOWN_SECONDS": 900,  # 15 минут
     "BTC_FILTER_ENABLED": True,
-    "EXCLUDED_SYMBOLS": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
-
+    "DEBUG_REASONS": False,
 }
 
 
@@ -58,8 +54,8 @@ class SignalState:
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
         self.symbol_last_signal_ts: Dict[str, float] = {}
-        self.last_any_signal_ts: Optional[float] = None
         self.risk_off: bool = False
+        self.sent_signals_cache: set = set()  # Защита от дублей
 
     def reset_if_new_day(self) -> None:
         today = date.today()
@@ -67,16 +63,13 @@ class SignalState:
             logging.info("Новый день, обнуляем счётчики сигналов.")
             self.signals_sent_today = 0
             self.last_reset_date = today
+            self.sent_signals_cache.clear()  # Очищаем кэш при смене дня
 
     def can_send_signal(self, symbol: str) -> bool:
         self.reset_if_new_day()
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
         now = time.time()
-        # Global cooldown between ANY signals
-        gcd = float(CONFIG.get("GLOBAL_SIGNAL_COOLDOWN_SECONDS", 0) or 0)
-        if gcd > 0 and self.last_any_signal_ts is not None and (now - self.last_any_signal_ts) < gcd:
-            return False
         last_ts = self.symbol_last_signal_ts.get(symbol)
         if (
             last_ts is not None
@@ -89,7 +82,6 @@ class SignalState:
         self.signals_sent_today += 1
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
-        self.last_any_signal_ts = self.symbol_last_signal_ts[symbol]
 
     def is_risk_off(self) -> bool:
         return self.risk_off
@@ -99,6 +91,12 @@ class SignalState:
 
 
 STATE = SignalState()
+
+
+def normalize_command(text: str) -> str:
+    """Нормализует команду, убирая эмодзи и лишние пробелы."""
+    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text)
+    return text.strip()
 
 
 def db_connect():
@@ -218,6 +216,7 @@ def db_get_subscribers_count() -> int:
         row = cur.fetchone()
     return int(row["c"]) if row else 0
 
+
 def db_log_signal(idea: Dict[str, Any], sent_to: int) -> None:
     """Логируем сигнал в БД для статистики в админке."""
     global DB_CONN
@@ -247,6 +246,7 @@ def db_log_signal(idea: Dict[str, Any], sent_to: int) -> None:
         )
     DB_CONN.commit()
 
+
 def db_fetch_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
     global DB_CONN
     if DB_CONN is None:
@@ -255,6 +255,7 @@ def db_fetch_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, A
         cur.execute(sql, params)
         return cur.fetchone()
 
+
 def db_fetch_all(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
     global DB_CONN
     if DB_CONN is None:
@@ -262,6 +263,7 @@ def db_fetch_all(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]
     with DB_CONN.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
         return cur.fetchall()
+
 
 def admin_stats_text(days: int = 7) -> str:
     """Операционная статистика (без PnL) за последние N дней."""
@@ -375,7 +377,7 @@ def get_reply_keyboard(chat_id: str) -> Dict[str, Any]:
 
     rows = [
         [{"text": "🚀 Старт"}, {"text": "📊 Статус"}],
-        [{"text": "ℹ️ Помощь"}, {"text": "📴 Стоп"}],
+        [{"text": "ℹ️ Помощь"}, {"text": "🔴 Стоп"}],
         [{"text": "🆔 Мой ID"}],
     ]
     if is_admin:
@@ -625,150 +627,196 @@ def build_signal_text(
 def analyse_symbol(
     symbol: str,
     btc_ctx: Dict[str, Any],
-    klines_5m: List[List[Any]],
-    klines_15m: List[List[Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Возвращает торговую идею или None.
-
-    Улучшения для точности:
-    - работаем ТОЛЬКО по закрытым свечам (исключаем последнюю, которая может быть незакрытой)
-    - реальная проверка 'импульсной' свечи (range/body относительно ATR)
-    - подтверждение по HTF EMA200 (15m) по направлению
-    - разворот StochRSI (сигнал берём на переломе, а не "где угодно")
-    - подтверждение пробоя экстремума импульсной свечи (опционально)
     """
+    Улучшенный анализ с:
+    - Проверкой импульса
+    - MTF подтверждением на 15m
+    - Мягким BTC-фильтром
+    - Защитой от шпилек
+    """
+    params = {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": 300}
+    kl_5m = fetch_binance("/fapi/v1/klines", params)
+    o5, h5, l5, c5, t5 = kline_to_floats(kl_5m)
+    
+    params_htf = {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": 200}
+    kl_15m = fetch_binance("/fapi/v1/klines", params_htf)
+    o15, h15, l15, c15, _ = kline_to_floats(kl_15m)
 
-    # ❌ полностью исключаем BTC из сигналов (но BTC-фильтр для альтов остаётся)
-    if symbol == "BTCUSDT":
+    ema200_5m = calc_ema(c5, 200)
+    ema200_15m = calc_ema(c15, 200)
+    rsi_5m = calc_rsi(c5, 14)
+    rsi_15m = calc_rsi(c15, 14)
+    atr_list = calc_atr(h5, l5, c5, 14)
+    macd_line, signal_line = calc_macd(c5)
+    stoch_rsi = calc_stoch_rsi(c5)
+
+    if len(c5) < 210 or len(ema200_5m) < 1 or len(atr_list) < 1 or len(ema200_15m) < 1:
         return None
 
-    # Используем уже переданные klines (чтобы не делать лишние запросы к Binance)
-    o5, h5, l5, c5, t5 = kline_to_floats(klines_5m)
-    _, _, _, c15, _ = kline_to_floats(klines_15m)
-
-    # Безопасность: исключаем последнюю (возможно незакрытую) свечу
-    if len(c5) < 220 or len(c15) < 220:
-        return None
-    o5c, h5c, l5c, c5c, t5c = o5[:-1], h5[:-1], l5[:-1], c5[:-1], t5[:-1]
-    c15c = c15[:-1]
-
-    ema200_5m = calc_ema(c5c, 200)
-    ema200_15m = calc_ema(c15c, 200)
-    rsi_5m = calc_rsi(c5c, 14)
-    atr_list = calc_atr(h5c, l5c, c5c, 14)
-    macd_line, signal_line = calc_macd(c5c)
-    stoch_rsi = calc_stoch_rsi(c5c)
-
-    # текущая закрытая свеча = последняя в срезе
-    close = c5c[-1]
-    ema = ema200_5m[-1]
-    ema_htf = ema200_15m[-1] if ema200_15m else ema
-    rsi = rsi_5m[-1]
-    atr_abs = atr_list[-1]
+    # ✅ ПАТЧ №1: Работаем ТОЛЬКО по закрытым свечам
+    # Индекс последней ЗАКРЫТОЙ свечи на 5m
+    idx_5m = -2
+    
+    close = c5[idx_5m]
+    ema = ema200_5m[idx_5m]
+    rsi = rsi_5m[idx_5m]
+    macd_val = macd_line[idx_5m]
+    macd_signal = signal_line[idx_5m]
+    stoch_val = stoch_rsi[idx_5m]
+    atr_abs = atr_list[idx_5m]
     atr_pct = atr_abs / close * 100.0
-    macd_val = macd_line[-1]
-    macd_signal = signal_line[-1]
-    macd_prev = macd_line[-2]
-    stoch_val = stoch_rsi[-1]
-    stoch_prev = stoch_rsi[-2]
+    
+    # ✅ ПАТЧ №1: HTF тоже только закрытая свеча
+    idx_15m = -2
+    ema_htf = ema200_15m[idx_15m]
+    rsi_htf = rsi_15m[idx_15m]
+    htf_close = c15[idx_15m]
 
-    # ATR фильтр
+    # 1. ATR фильтр
     if not (CONFIG["MIN_ATR_PCT"] <= atr_pct <= CONFIG["MAX_ATR_PCT"]):
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s отклонён по ATR: %.2f%% (допустимо %.2f—%.2f%%).",
+                         symbol, atr_pct, CONFIG["MIN_ATR_PCT"], CONFIG["MAX_ATR_PCT"])
         return None
 
-    # ====== Направление по тренду/моментуму (как и раньше, но чуть строже) ======
-    price_above = close > ema * 1.001
-    price_below = close < ema * 0.999
+    # 2. Проверка импульса (важно для импульсной модели)
+    # Импульсная свеча = предпоследняя закрытая (idx_5m уже -2)
+    impulse_idx = len(c5) - 2
+    impulse_close = c5[impulse_idx]
+    impulse_open = o5[impulse_idx]
+    impulse_body = abs(impulse_close - impulse_open)
+    
+    # Средний размер тела свечи за предыдущие 10 закрытых свечей
+    avg_body = sum(abs(c5[i] - o5[i]) for i in range(len(c5) - 12, len(c5) - 2)) / 10
+    
+    # Импульс должен быть хотя бы на 20% больше среднего тела
+    if impulse_body < avg_body * 1.2:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s отклонён: слабый импульс. body=%.6f avg=%.6f", 
+                         symbol, impulse_body, avg_body)
+        return None
+
+    # 3. Определение направления на 5m
+    price_above = close > ema * 1.0002
+    price_below = close < ema * 0.9998
 
     side: Optional[str] = None
-    if price_above and rsi > 50 and macd_val > macd_signal and macd_val > macd_prev:
+    
+    # Long условия (смягчённые)
+    if price_above and rsi > 48 and macd_val >= macd_signal and 10 < stoch_val < 90:
         side = "long"
-    elif price_below and rsi < 50 and macd_val < macd_signal and macd_val < macd_prev:
+    # Short условия (смягчённые)
+    elif price_below and rsi < 52 and macd_val <= macd_signal and 10 < stoch_val < 90:
         side = "short"
-    else:
+
+    if side is None:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s: нет направления. close=%.6f ema=%.6f rsi=%.1f macd=%.5f stoch=%.1f",
+                         symbol, close, ema, rsi, macd_val, stoch_val)
         return None
 
-    # Подтверждение HTF EMA200 (15m)
-    if CONFIG.get("REQUIRE_HTF_EMA_CONFIRM", True):
-        if side == "long" and close < ema_htf:
+    # 4. MTF подтверждение на 15m (тренд должен совпадать)
+    # htf_close уже определён выше как c15[idx_15m]
+    if side == "long":
+        if htf_close < ema_htf * 0.998:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: HTF нет long тренда. htf_close=%.6f htf_ema=%.6f",
+                             symbol, htf_close, ema_htf)
             return None
-        if side == "short" and close > ema_htf:
+        if rsi_htf < 45:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: HTF RSI слишком низкий %.1f", symbol, rsi_htf)
+            return None
+    else:  # short
+        if htf_close > ema_htf * 1.002:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: HTF нет short тренда. htf_close=%.6f htf_ema=%.6f",
+                             symbol, htf_close, ema_htf)
+            return None
+        if rsi_htf > 55:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: HTF RSI слишком высокий %.1f", symbol, rsi_htf)
             return None
 
-    # BTC фильтр (как у тебя, оставляем)
+    # 5. BTC-фильтр (МЯГКИЙ - только жёсткие условия)
     if CONFIG["BTC_FILTER_ENABLED"]:
         btc_price = btc_ctx["price"]
         btc_ema = btc_ctx["ema200"]
         btc_rsi = btc_ctx["rsi"]
         btc_change = btc_ctx["change_pct"]
+
         if side == "long":
-            if btc_price < btc_ema or btc_rsi < 45 or btc_change < -3.0:
+            # Блокируем long только при явном медвежьем рынке BTC
+            if btc_price < btc_ema * 0.996 or btc_rsi < 38 or btc_change < -6.0:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён по BTC-фильтру для long. BTC: price=%.2f ema=%.2f rsi=%.1f change=%.2f%%",
+                                 symbol, btc_price, btc_ema, btc_rsi, btc_change)
                 return None
-        else:
-            if btc_price > btc_ema or btc_rsi > 55 or btc_change > 3.0:
-                return None
-
-    # ====== Реальная "импульсная свеча" ======
-    # импульс = предпоследняя закрытая свеча
-    impulse_idx = len(c5c) - 2
-    impulse_open = o5c[impulse_idx]
-    impulse_close = c5c[impulse_idx]
-    impulse_low = l5c[impulse_idx]
-    impulse_high = h5c[impulse_idx]
-    impulse_time = datetime.fromtimestamp(t5c[impulse_idx] / 1000, timezone.utc)
-
-    impulse_range = impulse_high - impulse_low
-    impulse_body = abs(impulse_close - impulse_open)
-
-    # требования к силе импульса относительно ATR
-    if impulse_range < atr_abs * float(CONFIG.get("IMPULSE_RANGE_ATR_MULT", 1.20)):
-        return None
-    if impulse_body < atr_abs * float(CONFIG.get("IMPULSE_BODY_ATR_MULT", 0.55)):
-        return None
-
-    # направление импульса должно совпадать с направлением сделки
-    is_bull_impulse = impulse_close > impulse_open
-    is_bear_impulse = impulse_close < impulse_open
-    if side == "long" and not is_bull_impulse:
-        return None
-    if side == "short" and not is_bear_impulse:
-        return None
-
-    # подтверждение по StochRSI (разворот/перелом)
-    if CONFIG.get("REQUIRE_STOCH_REVERSAL", True):
-        if side == "long":
-            # хотим выход из перепроданности
-            if not (stoch_prev < 20 and stoch_val > stoch_prev):
-                return None
-        else:
-            # хотим разворот из перекупленности
-            if not (stoch_prev > 80 and stoch_val < stoch_prev):
+        else:  # short
+            # Блокируем short только при явном бычьем рынке BTC
+            if btc_price > btc_ema * 1.004 or btc_rsi > 62 or btc_change > 6.0:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён по BTC-фильтру для short. BTC: price=%.2f ema=%.2f rsi=%.1f change=%.2f%%",
+                                 symbol, btc_price, btc_ema, btc_rsi, btc_change)
                 return None
 
-    # подтверждение пробоя экстремума импульсной свечи (чтобы вход был "не раньше времени")
-    if CONFIG.get("CONFIRM_BREAKOUT", True):
-        if side == "long" and close <= impulse_high:
-            return None
-        if side == "short" and close >= impulse_low:
-            return None
+    # 6. Расчёт стопа и тейка с защитой от шпилек
+    impulse_low = l5[impulse_idx]
+    impulse_high = h5[impulse_idx]
+    impulse_time = datetime.fromtimestamp(t5[impulse_idx] / 1000, timezone.utc)
 
-    # ====== Стоп/тейк: стоп за экстремумом импульса ======
+    # ✅ ПАТЧ №2: Стоп считать ТОЛЬКО по закрытым свечам
+    # Берём swing за последние 4 закрытые свечи (исключая текущую "живую")
+    swing_lookback = 4
+    swing_low = min(l5[-(swing_lookback + 1):-1])
+    swing_high = max(h5[-(swing_lookback + 1):-1])
+    
+    buf_long = float(CONFIG.get("STOP_BUFFER_LONG", 0.30)) / 100.0
+    buf_short = float(CONFIG.get("STOP_BUFFER_SHORT", 0.30)) / 100.0
+    tp_extra = 1.0 + float(CONFIG.get("TP_EXTRA_PCT", 0.15)) / 100.0
+
     if side == "long":
-        stop_loss = impulse_low * 0.999
+        stop_loss = swing_low * (1.0 - buf_long)
+        # Защита: стоп не может быть выше или равен входу
+        if stop_loss >= close:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: стоп long выше входа. stop=%.6f close=%.6f",
+                             symbol, stop_loss, close)
+            return None
         stop_pct = abs((close - stop_loss) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: стоп %.3f%% вне диапазона %.3f—%.3f%%",
+                             symbol, stop_pct, CONFIG["MIN_STOP_PCT"], CONFIG["MAX_STOP_PCT"])
             return None
-        take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"]
+        take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((take_profit - close) / close) * 100.0
-    else:
-        stop_loss = impulse_high * 1.001
+    else:  # short
+        stop_loss = swing_high * (1.0 + buf_short)
+        # Защита: стоп не может быть ниже или равен входу
+        if stop_loss <= close:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: стоп short ниже входа. stop=%.6f close=%.6f",
+                             symbol, stop_loss, close)
+            return None
         stop_pct = abs((stop_loss - close) / close) * 100.0
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: стоп %.3f%% вне диапазона %.3f—%.3f%%",
+                             symbol, stop_pct, CONFIG["MIN_STOP_PCT"], CONFIG["MAX_STOP_PCT"])
             return None
-        take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"]
+        take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((close - take_profit) / close) * 100.0
 
     leverage = 20
+
+    # ✅ ПАТЧ №4: Защита от дублей
+    signal_key = f"{symbol}_{side}_{impulse_time.isoformat()}"
+    if signal_key in STATE.sent_signals_cache:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s отклонён: дубликат сигнала (уже отправлен)", symbol)
+        return None
 
     return {
         "symbol": symbol,
@@ -778,7 +826,6 @@ def analyse_symbol(
         "take_profit": take_profit,
         "stop_loss": stop_loss,
         "ema200": ema,
-        "ema200_htf": ema_htf,
         "rsi": rsi,
         "impulse_time": impulse_time,
         "atr_pct": atr_pct,
@@ -786,6 +833,7 @@ def analyse_symbol(
         "tp_pct": tp_pct,
         "macd": macd_val,
         "stoch_rsi": stoch_val,
+        "signal_key": signal_key,  # Для регистрации в кэше
     }
 
 
@@ -797,6 +845,7 @@ def scan_market_and_send_signals() -> int:
     if in_fomc_window(now_utc):
         logging.info("Сейчас окно FOMC, сканирование отключено.")
         return 0
+    
     btc_ctx = get_btc_context()
     symbols = get_usdt_perp_symbols()
     symbols = get_24h_volume_filter(symbols)
@@ -806,21 +855,23 @@ def scan_market_and_send_signals() -> int:
     if not active_subs:
         logging.info("Нет активных подписчиков, сигналы отправляться не будут.")
         return 0
+    
     signals_for_scan = 0
     for symbol in symbols:
-        if symbol in CONFIG.get("EXCLUDED_SYMBOLS", []):
-            continue
         if signals_for_scan >= CONFIG["MAX_SIGNALS_PER_SCAN"]:
             break
         if not STATE.can_send_signal(symbol):
             continue
-        kl_5m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": CONFIG.get("KLINES_LIMIT_5M", 300)})
-        kl_15m = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": CONFIG["HTF_TIMEFRAME"], "limit": CONFIG.get("KLINES_LIMIT_15M", 200)})
-
-        idea = analyse_symbol(symbol, btc_ctx, kl_5m, kl_15m)
-
+        
+        try:
+            idea = analyse_symbol(symbol, btc_ctx)
+        except Exception as e:
+            logging.error("Ошибка анализа %s: %s", symbol, e)
+            continue
+            
         if not idea:
             continue
+        
         text = build_signal_text(
             symbol=idea["symbol"],
             side=idea["side"],
@@ -836,17 +887,21 @@ def scan_market_and_send_signals() -> int:
             macd=idea["macd"],
             stoch_rsi=idea["stoch_rsi"],
         )
+        
         for cid in active_subs:
             send_telegram_message(text, chat_id=str(cid), html=True)
+        
+        # Регистрируем сигнал в кэше для защиты от дублей
+        STATE.sent_signals_cache.add(idea.get("signal_key"))
         STATE.register_signal(symbol)
         signals_for_scan += 1
+        
         try:
             db_log_signal(idea, sent_to=len(active_subs))
         except Exception as e:
             logging.error("Не удалось записать сигнал в БД: %s", e)
-        logging.info(
-            "Сигнал отправлен: %s %s", symbol, idea["side"]
-        )
+        
+        logging.info("Сигнал отправлен: %s %s", symbol, idea["side"])
 
     logging.info(
         "Сканирование завершено. Отправлено сигналов: %d, всего за день: %d/%d",
@@ -864,7 +919,6 @@ def handle_command(update: Dict[str, Any]) -> None:
     chat_id = str(chat.get("id", ""))
     user = msg.get("from", {}) or {}
     user_id = str(user.get("id", ""))
-    username = (user.get("username") or "").strip()
 
     if not chat_id:
         return
@@ -872,8 +926,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     is_admin = bool(TG_ADMIN_ID) and (user_id == str(TG_ADMIN_ID))
     kb = get_reply_keyboard(chat_id)
 
-    # нормализуем ввод (кнопки/эмодзи)
-    lower = text_in.lower()
+    lower = normalize_command(text_in).lower()
     first_token = (text_in.split()[:1] or [""])[0].lower()
 
     # ===== Пользовательские команды =====
@@ -887,10 +940,10 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    if first_token in ("/stop",) or lower in ("стоп", "📴 стоп"):
+    if first_token in ("/stop",) or lower in ("стоп", "🔴 стоп"):
         db_unsubscribe(chat_id)
         send_telegram_message(
-            "📴 Подписка выключена. Если передумаете — нажмите 🚀 Старт.",
+            "🔴 Подписка выключена. Если передумаете — нажмите 🚀 Старт.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
@@ -901,7 +954,7 @@ def handle_command(update: Dict[str, Any]) -> None:
         help_text = (
             "<b>ℹ️ Помощь</b>\n\n"
             "• 🚀 <b>Старт</b> — подписаться на сигналы\n"
-            "• 📴 <b>Стоп</b> — отписаться\n"
+            "• 🔴 <b>Стоп</b> — отписаться\n"
             "• 📊 <b>Статус</b> — параметры/режимы бота\n\n"
             "Если вы админ — появятся дополнительные кнопки."
         )
@@ -926,8 +979,7 @@ def handle_command(update: Dict[str, Any]) -> None:
             f"🎯 Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
             f"📈 Multi-TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
             f"💹 Фильтр BTC: {'включён' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}",
-            
-            f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%",
+            f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
             f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             f"🛑 Risk OFF: {risk_off_state}",
         ]
@@ -940,7 +992,6 @@ def handle_command(update: Dict[str, Any]) -> None:
 
     # ===== Админские команды =====
     if not is_admin:
-        # не админ и не распознали команду
         send_telegram_message(
             "Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
             chat_id=chat_id,
@@ -949,7 +1000,6 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    # Админ: панель
     if first_token in ("/admin",) or lower in ("админ", "🛠 админ"):
         msg_admin = (
             "<b>🛠 Админ-панель</b>\n\n"
@@ -957,14 +1007,12 @@ def handle_command(update: Dict[str, Any]) -> None:
             f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
             f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
             f"💹 BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}\n"
-            f"🎯 k (STOP_ATR_MULTIPLIER): {CONFIG.get('STOP_ATR_MULTIPLIER', 0.6)}\n"
-            f"🔥 ATR min/max: {CONFIG['MIN_ATR_PCT']}–{CONFIG['MAX_ATR_PCT']}%\n\n"
+            f"🔥 ATR min/max: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%\n\n"
             "Используйте кнопки админа ниже 👇"
         )
         send_telegram_message(msg_admin, chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    # Админ: статистика
     if first_token in ("/stats",) or lower.startswith("📈 статистика") or lower.startswith("статистика"):
         days = 7
         parts = text_in.split()
@@ -976,7 +1024,6 @@ def handle_command(update: Dict[str, Any]) -> None:
         send_telegram_message(admin_stats_text(days), chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    # Админ: Risk OFF/ON
     if first_token in ("/risk_off",) or lower in ("🛑 risk off", "risk off"):
         STATE.set_risk_off(True)
         send_telegram_message("🛑 Режим <b>Risk OFF</b> включён. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
@@ -987,9 +1034,8 @@ def handle_command(update: Dict[str, Any]) -> None:
         send_telegram_message("✅ Режим <b>Risk OFF</b> выключен. Сканирование включено.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    # Админ: тест-скан (асинхронно)
     if first_token in ("/scan",) or lower in ("🧪 тест-скан", "тест-скан", "тест скан"):
-        send_telegram_message("🧪 Тест-скан запущен…\n⏳ Это может занять 10–60 секунд.", chat_id=chat_id, html=False, reply_markup=kb)
+        send_telegram_message("🧪 Тест-скан запущен…\n⏳ Это может занять 10—60 секунд.", chat_id=chat_id, html=False, reply_markup=kb)
 
         def _run_scan_async(admin_chat_id: str) -> None:
             try:
@@ -999,13 +1045,6 @@ def handle_command(update: Dict[str, Any]) -> None:
                 send_telegram_message(f"❌ Ошибка тест-скана: {e}", chat_id=admin_chat_id, html=False, reply_markup=kb)
 
         threading.Thread(target=_run_scan_async, args=(chat_id,), daemon=True).start()
-        return
-
-    # Админ: настройки (если в коде есть /settings обработчик — оставляем отдельно ниже)
-    if first_token in ("/settings",) or lower.startswith("⚙️ настройки"):
-        # если ниже по файлу есть полноценный обработчик /settings — можно оставить;
-        # здесь просто подсказка на случай, если настройки реализованы в отдельном блоке.
-        send_telegram_message("⚙️ Настройки: используйте /settings и параметры, как в инструкции в админке.", chat_id=chat_id, html=False, reply_markup=kb)
         return
 
     send_telegram_message(
@@ -1019,7 +1058,7 @@ def handle_command(update: Dict[str, Any]) -> None:
 def telegram_polling_loop() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN не задан. Завершение.")
-        return 0
+        return
     last_update_id = None
     logging.info("Запуск Telegram bot polling...")
     while True:
@@ -1043,22 +1082,32 @@ def telegram_polling_loop() -> None:
             msg = upd.get("message") or upd.get("edited_message")
             if not msg:
                 continue
-            # ВАЖНО: пропускаем ВСЕ входящие сообщения в общий обработчик,
-            # иначе часть кнопок (Админ/Статистика/Мой ID) никогда не сработает.
-            handle_command(upd)
+            text = msg.get("text", "") or ""
+            if text.startswith("/") or any(kw in text.lower() for kw in ["старт", "стоп", "помощь", "статус", "админ", "настройки", "risk", "тест-скан", "статистика", "мой id"]):
+                handle_command(upd)
+            else:
+                chat_id = str(msg.get("chat", {}).get("id"))
+                send_telegram_message(
+                    "Я пока не понимаю эту команду.\n"
+                    "Пожалуйста, используйте кнопки под полем ввода или /help.",
+                    chat_id=chat_id,
+                    html=False,
+                    reply_markup=get_reply_keyboard(chat_id),
+                )
+
 
 def main_loop() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN не задан. Выход.")
-        return 0
+        return
     db_ensure_tables()
 
     logging.info("=" * 60)
-    logging.info("Запуск Binance Futures Signal Bot")
+    logging.info("Запуск Binance Futures Signal Bot (УЛУЧШЕННАЯ ВЕРСИЯ)")
     logging.info("=" * 60)
     logging.info("Конфигурация:")
     logging.info("  - Минимальный объём: %s USDT", f"{CONFIG['MIN_QUOTE_VOLUME']:,}")
-    logging.info("  - Таймфрейм: %s", CONFIG["TIMEFRAME"])
+    logging.info("  - Таймфрейм: %s + %s", CONFIG["TIMEFRAME"], CONFIG["HTF_TIMEFRAME"])
     logging.info("  - Интервал сканирования: %d сек", CONFIG["SCAN_INTERVAL_SECONDS"])
     logging.info("  - Лимит сигналов в день: %d", CONFIG["MAX_SIGNALS_PER_DAY"])
     logging.info("  - Risk/Reward: %.2f", CONFIG["RISK_REWARD"])
@@ -1066,10 +1115,7 @@ def main_loop() -> None:
     logging.info("  - Мин. ATR: %.3f%%", CONFIG["MIN_ATR_PCT"])
     logging.info("  - Макс. сигналов за скан: %d", CONFIG["MAX_SIGNALS_PER_SCAN"])
     logging.info("  - BTC фильтр: %s", "ON" if CONFIG["BTC_FILTER_ENABLED"] else "OFF")
-    if not FOMC_DATES_UTC:
-        logging.info("  - FOMC-окна: не настроены (список дат пуст).")
-    else:
-        logging.info("  - FOMC-окна: %d дат.", len(FOMC_DATES_UTC))
+    logging.info("  - Cooldown на символ: %d сек", CONFIG["SYMBOL_COOLDOWN_SECONDS"])
 
     last_scan_ts = 0.0
 
@@ -1080,7 +1126,6 @@ def main_loop() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-        # Start Telegram polling in background thread
     threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
     while True:
@@ -1092,17 +1137,13 @@ def main_loop() -> None:
             except Exception as e:
                 logging.error("Ошибка при сканировании рынка: %s", e)
             last_scan_ts = time.time()
-            logging.info(
-                "Ожидание %d секунд до следующего сканирования...",
-                CONFIG["SCAN_INTERVAL_SECONDS"],
-            )
-
-
         time.sleep(1)
+
+
 if __name__ == "__main__":
     try:
         main_loop()
     except SystemExit:
         logging.info("Бот остановлен.")
-    except Exception:
-        logging.exception("Критическая ошибка")
+    except Exception as e:
+        logging.error("Критическая ошибка: %s", e)
