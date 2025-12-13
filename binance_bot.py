@@ -31,14 +31,14 @@ FOMC_DATES_UTC: List[datetime] = []
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
-    "SCAN_INTERVAL_SECONDS": 300,  # 5 минут
-    "MAX_SIGNALS_PER_DAY": 8,  # ✅ Снижено с 10 до 8
-    "MAX_SIGNALS_PER_HOUR": 2,  # ✅ НОВЫЙ: макс 2 сигнала в час
-    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ НОВЫЙ: из одного скана только 1 лучший
-    "MIN_SEND_GAP_SECONDS": 600,  # ✅ НОВЫЙ: мин. 10 минут между отправками
-    "MIN_QUOTE_VOLUME": 20_000_000,
+    "SCAN_INTERVAL_SECONDS": 600,  # ✅ 10 минут (было 300)
+    "MAX_SIGNALS_PER_DAY": 8,
+    "MAX_SIGNALS_PER_HOUR": 2,
+    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ Топ-2 лучших кандидата
+    "MIN_SEND_GAP_SECONDS": 1800,  # ✅ 30 минут между отправками (было 600)
+    "MIN_QUOTE_VOLUME": 40_000_000,  # ✅ 40M USDT (было 20M)
     "RISK_REWARD": 1.7,
-    "MIN_ATR_PCT": 0.25,
+    "MIN_ATR_PCT": 0.30,
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.15,
     "MAX_STOP_PCT": 1.20,
@@ -46,7 +46,7 @@ CONFIG: Dict[str, Any] = {
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.15,
     "MIN_TP_DISTANCE_PCT": 0.50,
-    "SYMBOL_COOLDOWN_SECONDS": 1800,  # ✅ Увеличено с 900 до 30 минут
+    "SYMBOL_COOLDOWN_SECONDS": 1800,  # 30 минут
     "BTC_FILTER_ENABLED": True,
     "DEBUG_REASONS": False,
 }
@@ -55,13 +55,13 @@ CONFIG: Dict[str, Any] = {
 class SignalState:
     def __init__(self) -> None:
         self.signals_sent_today: int = 0
-        self.signals_sent_this_hour: int = 0  # ✅ НОВЫЙ: счётчик за час
+        self.signals_sent_this_hour: int = 0
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
-        self.last_hour_reset: int = datetime.now().hour  # ✅ НОВЫЙ: последний сброс часа
+        self.last_hour_reset: int = datetime.now().hour
         self.symbol_last_signal_ts: Dict[str, float] = {}
         self.risk_off: bool = False
-        self.sent_signals_cache: set = set()  # Защита от дублей
+        self.sent_signals_cache: set = set()
 
     def reset_if_new_day(self) -> None:
         today = date.today()
@@ -69,39 +69,44 @@ class SignalState:
             logging.info("Новый день, обнуляем счётчики сигналов.")
             self.signals_sent_today = 0
             self.last_reset_date = today
-            self.sent_signals_cache.clear()  # Очищаем кэш при смене дня
+            self.sent_signals_cache.clear()
 
     def reset_if_new_hour(self) -> None:
-        """✅ НОВЫЙ: Сбрасываем часовой счётчик при смене часа"""
+        """Сбрасываем часовой счётчик при смене часа"""
         current_hour = datetime.now().hour
         if current_hour != self.last_hour_reset:
             logging.info("Новый час, обнуляем часовой счётчик. Было: %d", self.signals_sent_this_hour)
             self.signals_sent_this_hour = 0
             self.last_hour_reset = current_hour
 
-    def can_send_signal(self, symbol: str) -> bool:
+    def can_send_global(self) -> bool:
+        """✅ НОВАЯ ФУНКЦИЯ: Проверяет только глобальные лимиты (день/час)"""
         self.reset_if_new_day()
-        self.reset_if_new_hour()  # ✅ НОВЫЙ
+        self.reset_if_new_hour()
         
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
         
-        # ✅ НОВЫЙ: проверка часового лимита
         if self.signals_sent_this_hour >= CONFIG["MAX_SIGNALS_PER_HOUR"]:
             return False
         
+        return True
+
+    def can_send_symbol(self, symbol: str) -> bool:
+        """✅ НОВАЯ ФУНКЦИЯ: Проверяет только cooldown по символу"""
         now = time.time()
         last_ts = self.symbol_last_signal_ts.get(symbol)
-        if (
-            last_ts is not None
-            and now - last_ts < CONFIG["SYMBOL_COOLDOWN_SECONDS"]
-        ):
+        if last_ts is not None and now - last_ts < CONFIG["SYMBOL_COOLDOWN_SECONDS"]:
             return False
         return True
 
+    def can_send_signal(self, symbol: str) -> bool:
+        """✅ УСТАРЕВШАЯ: Для обратной совместимости. Используйте can_send_global() и can_send_symbol()"""
+        return self.can_send_global() and self.can_send_symbol(symbol)
+
     def register_signal(self, symbol: str) -> None:
         self.signals_sent_today += 1
-        self.signals_sent_this_hour += 1  # ✅ НОВЫЙ
+        self.signals_sent_this_hour += 1
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
 
@@ -114,7 +119,7 @@ class SignalState:
 
 STATE = SignalState()
 
-# ✅ НОВЫЙ: Очередь отправки сигналов
+# ✅ Очередь отправки сигналов
 SEND_QUEUE: deque = deque()
 LAST_SEND_TS: float = 0.0
 
@@ -134,38 +139,48 @@ def enqueue_signal(signal_data: Dict[str, Any]) -> None:
 
 
 def try_send_from_queue() -> None:
-    """✅ НОВАЯ ФУНКЦИЯ: Пытается отправить сигнал из очереди с учётом лимитов"""
+    """✅ ПЕРЕПИСАНО: Отправляет сигнал из очереди с правильными проверками"""
     global SEND_QUEUE, LAST_SEND_TS
     
     if not SEND_QUEUE:
         return
     
-    # Проверяем временной интервал
     now = time.time()
+    
+    # 1. Проверяем временной интервал (MIN_SEND_GAP_SECONDS)
     if now - LAST_SEND_TS < CONFIG["MIN_SEND_GAP_SECONDS"]:
         return
     
-    # Проверяем лимиты
-    if not STATE.can_send_signal(""):
-        logging.info("Достигнут лимит сигналов (день: %d/%d, час: %d/%d). Очередь: %d",
+    # 2. Проверяем глобальные лимиты (день/час)
+    if not STATE.can_send_global():
+        logging.info("Достигнут глобальный лимит (день: %d/%d, час: %d/%d). Очередь: %d",
                      STATE.signals_sent_today, CONFIG["MAX_SIGNALS_PER_DAY"],
                      STATE.signals_sent_this_hour, CONFIG["MAX_SIGNALS_PER_HOUR"],
                      len(SEND_QUEUE))
         return
     
-    # Берём первый сигнал из очереди
+    # 3. Берём первый сигнал из очереди
     signal_data = SEND_QUEUE.popleft()
-    
-    # Проверяем cooldown для символа
     symbol = signal_data["symbol"]
-    if not STATE.can_send_signal(symbol):
-        logging.info("Символ %s ещё в cooldown, пропускаем", symbol)
+    signal_key = signal_data.get("signal_key")
+    
+    # 4. Проверяем антидубликат (может быть уже отправлен)
+    if signal_key and signal_key in STATE.sent_signals_cache:
+        logging.info("Сигнал %s уже был отправлен (дубликат), пропускаем", symbol)
+        return  # НЕ возвращаем в очередь
+    
+    # 5. Проверяем cooldown для символа
+    if not STATE.can_send_symbol(symbol):
+        # ✅ ИСПРАВЛЕНО: Возвращаем в КОНЕЦ очереди, чтобы не блокировать
+        SEND_QUEUE.append(signal_data)
+        logging.info("Символ %s ещё в cooldown, возвращён в конец очереди (в очереди: %d)",
+                     symbol, len(SEND_QUEUE))
         return
     
-    # Отправляем сигнал
+    # 6. Отправляем сигнал
     active_subs = db_get_active_subscribers()
     if not active_subs:
-        logging.info("Нет активных подписчиков")
+        logging.info("Нет активных подписчиков, сигнал пропущен")
         return
     
     text = build_signal_text(
@@ -187,18 +202,20 @@ def try_send_from_queue() -> None:
     for cid in active_subs:
         send_telegram_message(text, chat_id=str(cid), html=True)
     
-    # Регистрируем отправку
-    STATE.sent_signals_cache.add(signal_data.get("signal_key"))
+    # 7. Регистрируем отправку
+    if signal_key:  # ✅ ИСПРАВЛЕНО: добавляем только если key truthy
+        STATE.sent_signals_cache.add(signal_key)
     STATE.register_signal(symbol)
     LAST_SEND_TS = now
     
+    # 8. Логируем в БД
     try:
         db_log_signal(signal_data, sent_to=len(active_subs))
     except Exception as e:
         logging.error("Не удалось записать сигнал в БД: %s", e)
     
-    logging.info("✅ Сигнал отправлен: %s %s (осталось в очереди: %d)",
-                 symbol, signal_data["side"], len(SEND_QUEUE))
+    logging.info("✅ Сигнал отправлен: %s %s (score: %.2f, осталось в очереди: %d)",
+                 symbol, signal_data["side"], signal_data.get("score", 0), len(SEND_QUEUE))
 
 
 def db_connect():
@@ -660,10 +677,10 @@ def get_btc_context() -> Dict[str, Any]:
         {"symbol": "BTCUSDT", "interval": "5m", "limit": 300},
     )
     _, _, _, closes, _ = kline_to_floats(kl)
-    ema200 = calc_ema(closes, 200)[-1]
-    rsi = calc_rsi(closes, 14)[-1]
+    ema200 = calc_ema(closes, 200)[-2]
+    rsi = calc_rsi(closes, 14)[-2]
     ticker = fetch_binance("/fapi/v1/ticker/24hr", {"symbol": "BTCUSDT"})
-    price = float(ticker.get("lastPrice", closes[-1]))
+    price = float(ticker.get("lastPrice", closes[-2]))
     change_pct = float(ticker.get("priceChangePercent", 0.0))
     ctx = {
         "price": price,
@@ -979,7 +996,7 @@ def analyse_symbol(
 
 
 def scan_market_and_send_signals() -> int:
-    """✅ ИЗМЕНЕНО: Теперь собирает кандидатов и добавляет в очередь"""
+    """✅ ПЕРЕПИСАНО: Собирает кандидатов, выбирает топ-N, добавляет в очередь"""
     if STATE.is_risk_off():
         logging.info("Режим Risk OFF, сканирование пропускается.")
         return 0
@@ -993,7 +1010,7 @@ def scan_market_and_send_signals() -> int:
     symbols = get_24h_volume_filter(symbols)
     logging.info("Анализ %d символов...", len(symbols))
 
-    # ✅ НОВАЯ ЛОГИКА: Собираем кандидатов, не отправляем сразу
+    # 1. Собираем ВСЕ кандидатов
     candidates: List[Dict[str, Any]] = []
     
     for symbol in symbols:
@@ -1010,25 +1027,47 @@ def scan_market_and_send_signals() -> int:
         logging.info("Сканирование завершено. Кандидатов не найдено.")
         return 0
     
-    # ✅ НОВАЯ ЛОГИКА: Выбираем лучший сигнал по score
-    best_candidate = max(candidates, key=lambda x: x.get("score", 0))
+    # 2. Сортируем по score (лучшие сверху)
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
     
-    logging.info("Найдено кандидатов: %d. Лучший: %s %s (score: %.2f)",
-                 len(candidates),
-                 best_candidate["symbol"],
-                 best_candidate["side"],
-                 best_candidate.get("score", 0))
+    # 3. Берём топ-N лучших
+    max_to_enqueue = CONFIG["MAX_SIGNALS_PER_SCAN"]
+    top_candidates = candidates[:max_to_enqueue]
     
-    # ✅ НОВАЯ ЛОГИКА: Добавляем в очередь вместо немедленной отправки
-    enqueue_signal(best_candidate)
+    logging.info("Найдено кандидатов: %d. Топ-%d (по score):",
+                 len(candidates), len(top_candidates))
+    
+    for i, cand in enumerate(top_candidates, 1):
+        logging.info("  %d. %s %s (score: %.2f, ATR: %.2f%%, тейк: %.2f%%)",
+                     i, cand["symbol"], cand["side"],
+                     cand.get("score", 0),
+                     cand.get("atr_pct", 0),
+                     cand.get("tp_pct", 0))
+    
+    # 4. Добавляем в очередь
+    added_count = 0
+    for cand in top_candidates:
+        signal_key = cand.get("signal_key")
+        
+        # Проверяем антидубликат ПЕРЕД добавлением в очередь
+        if signal_key and signal_key in STATE.sent_signals_cache:
+            logging.info("Сигнал %s уже был отправлен (дубликат), пропускаем", cand["symbol"])
+            continue
+        
+        enqueue_signal(cand)
+        added_count += 1
+    
+    # 5. Пытаемся отправить из очереди сразу (если можем)
+    try_send_from_queue()
     
     logging.info(
-        "Сканирование завершено. В очереди сигналов: %d, отправлено за день: %d/%d",
+        "Сканирование завершено. Добавлено в очередь: %d, в очереди всего: %d, отправлено за день: %d/%d",
+        added_count,
         len(SEND_QUEUE),
         STATE.signals_sent_today,
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
-    return 1
+    return added_count
 
 
 def handle_command(update: Dict[str, Any]) -> None:
