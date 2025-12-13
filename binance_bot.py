@@ -6,6 +6,7 @@ import logging
 import signal
 import threading
 import re
+from collections import deque
 from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -31,18 +32,21 @@ CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
     "SCAN_INTERVAL_SECONDS": 300,  # 5 минут
-    "MAX_SIGNALS_PER_DAY": 10,
-    "MIN_QUOTE_VOLUME": 20_000_000,  # Снижено с 50M для большего количества сигналов
-    "RISK_REWARD": 1.7,  # Оптимально 1.7-1.9
-    "MIN_ATR_PCT": 0.15,  # Согласно промпту
+    "MAX_SIGNALS_PER_DAY": 8,  # ✅ Снижено с 10 до 8
+    "MAX_SIGNALS_PER_HOUR": 2,  # ✅ НОВЫЙ: макс 2 сигнала в час
+    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ НОВЫЙ: из одного скана только 1 лучший
+    "MIN_SEND_GAP_SECONDS": 600,  # ✅ НОВЫЙ: мин. 10 минут между отправками
+    "MIN_QUOTE_VOLUME": 20_000_000,
+    "RISK_REWARD": 1.7,
+    "MIN_ATR_PCT": 0.25,
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.15,  # Согласно промпту
-    "MAX_STOP_PCT": 1.20,  # Увеличено для меньшего количества ложных отказов
-    "STOP_BUFFER_LONG": 0.20,  # Оптимально для tight-risk
+    "MIN_STOP_PCT": 0.15,
+    "MAX_STOP_PCT": 1.20,
+    "STOP_BUFFER_LONG": 0.20,
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.15,
-    "MAX_SIGNALS_PER_SCAN": 2,
-    "SYMBOL_COOLDOWN_SECONDS": 900,  # 15 минут
+    "MIN_TP_DISTANCE_PCT": 0.50,
+    "SYMBOL_COOLDOWN_SECONDS": 1800,  # ✅ Увеличено с 900 до 30 минут
     "BTC_FILTER_ENABLED": True,
     "DEBUG_REASONS": False,
 }
@@ -51,8 +55,10 @@ CONFIG: Dict[str, Any] = {
 class SignalState:
     def __init__(self) -> None:
         self.signals_sent_today: int = 0
+        self.signals_sent_this_hour: int = 0  # ✅ НОВЫЙ: счётчик за час
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
+        self.last_hour_reset: int = datetime.now().hour  # ✅ НОВЫЙ: последний сброс часа
         self.symbol_last_signal_ts: Dict[str, float] = {}
         self.risk_off: bool = False
         self.sent_signals_cache: set = set()  # Защита от дублей
@@ -65,10 +71,25 @@ class SignalState:
             self.last_reset_date = today
             self.sent_signals_cache.clear()  # Очищаем кэш при смене дня
 
+    def reset_if_new_hour(self) -> None:
+        """✅ НОВЫЙ: Сбрасываем часовой счётчик при смене часа"""
+        current_hour = datetime.now().hour
+        if current_hour != self.last_hour_reset:
+            logging.info("Новый час, обнуляем часовой счётчик. Было: %d", self.signals_sent_this_hour)
+            self.signals_sent_this_hour = 0
+            self.last_hour_reset = current_hour
+
     def can_send_signal(self, symbol: str) -> bool:
         self.reset_if_new_day()
+        self.reset_if_new_hour()  # ✅ НОВЫЙ
+        
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
+        
+        # ✅ НОВЫЙ: проверка часового лимита
+        if self.signals_sent_this_hour >= CONFIG["MAX_SIGNALS_PER_HOUR"]:
+            return False
+        
         now = time.time()
         last_ts = self.symbol_last_signal_ts.get(symbol)
         if (
@@ -80,6 +101,7 @@ class SignalState:
 
     def register_signal(self, symbol: str) -> None:
         self.signals_sent_today += 1
+        self.signals_sent_this_hour += 1  # ✅ НОВЫЙ
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
 
@@ -92,11 +114,91 @@ class SignalState:
 
 STATE = SignalState()
 
+# ✅ НОВЫЙ: Очередь отправки сигналов
+SEND_QUEUE: deque = deque()
+LAST_SEND_TS: float = 0.0
+
 
 def normalize_command(text: str) -> str:
     """Нормализует команду, убирая эмодзи и лишние пробелы."""
     text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text)
     return text.strip()
+
+
+def enqueue_signal(signal_data: Dict[str, Any]) -> None:
+    """✅ НОВАЯ ФУНКЦИЯ: Добавляет сигнал в очередь отправки"""
+    global SEND_QUEUE
+    SEND_QUEUE.append(signal_data)
+    logging.info("Сигнал добавлен в очередь: %s %s (в очереди: %d)",
+                 signal_data["symbol"], signal_data["side"], len(SEND_QUEUE))
+
+
+def try_send_from_queue() -> None:
+    """✅ НОВАЯ ФУНКЦИЯ: Пытается отправить сигнал из очереди с учётом лимитов"""
+    global SEND_QUEUE, LAST_SEND_TS
+    
+    if not SEND_QUEUE:
+        return
+    
+    # Проверяем временной интервал
+    now = time.time()
+    if now - LAST_SEND_TS < CONFIG["MIN_SEND_GAP_SECONDS"]:
+        return
+    
+    # Проверяем лимиты
+    if not STATE.can_send_signal(""):
+        logging.info("Достигнут лимит сигналов (день: %d/%d, час: %d/%d). Очередь: %d",
+                     STATE.signals_sent_today, CONFIG["MAX_SIGNALS_PER_DAY"],
+                     STATE.signals_sent_this_hour, CONFIG["MAX_SIGNALS_PER_HOUR"],
+                     len(SEND_QUEUE))
+        return
+    
+    # Берём первый сигнал из очереди
+    signal_data = SEND_QUEUE.popleft()
+    
+    # Проверяем cooldown для символа
+    symbol = signal_data["symbol"]
+    if not STATE.can_send_signal(symbol):
+        logging.info("Символ %s ещё в cooldown, пропускаем", symbol)
+        return
+    
+    # Отправляем сигнал
+    active_subs = db_get_active_subscribers()
+    if not active_subs:
+        logging.info("Нет активных подписчиков")
+        return
+    
+    text = build_signal_text(
+        symbol=signal_data["symbol"],
+        side=signal_data["side"],
+        leverage=signal_data["leverage"],
+        entry=signal_data["entry"],
+        take_profit=signal_data["take_profit"],
+        stop_loss=signal_data["stop_loss"],
+        timeframe=CONFIG["TIMEFRAME"],
+        ema200=signal_data["ema200"],
+        rsi=signal_data["rsi"],
+        impulse_time=signal_data["impulse_time"],
+        atr_pct=signal_data["atr_pct"],
+        macd=signal_data["macd"],
+        stoch_rsi=signal_data["stoch_rsi"],
+    )
+    
+    for cid in active_subs:
+        send_telegram_message(text, chat_id=str(cid), html=True)
+    
+    # Регистрируем отправку
+    STATE.sent_signals_cache.add(signal_data.get("signal_key"))
+    STATE.register_signal(symbol)
+    LAST_SEND_TS = now
+    
+    try:
+        db_log_signal(signal_data, sent_to=len(active_subs))
+    except Exception as e:
+        logging.error("Не удалось записать сигнал в БД: %s", e)
+    
+    logging.info("✅ Сигнал отправлен: %s %s (осталось в очереди: %d)",
+                 symbol, signal_data["side"], len(SEND_QUEUE))
 
 
 def db_connect():
@@ -696,6 +798,14 @@ def analyse_symbol(
             logging.info("%s отклонён: слабый импульс. body=%.6f avg=%.6f", 
                          symbol, impulse_body, avg_body)
         return None
+    
+    # ✅ УЛУЧШЕНИЕ №2: импульс должен быть значимым относительно ATR
+    min_impulse_atr = atr_abs * 0.3
+    if impulse_body < min_impulse_atr:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s отклонён: слабый импульс относительно ATR. body=%.6f min_atr=%.6f",
+                         symbol, impulse_body, min_impulse_atr)
+        return None
 
     # 3. Определение направления на 5m
     price_above = close > ema * 1.0002
@@ -703,11 +813,12 @@ def analyse_symbol(
 
     side: Optional[str] = None
     
-    # Long условия (смягчённые)
-    if price_above and rsi > 48 and macd_val >= macd_signal and 10 < stoch_val < 90:
+    # ✅ УЛУЧШЕНИЕ №3: ужесточены RSI и StochRSI диапазоны
+    # Long условия
+    if price_above and 50 < rsi < 70 and macd_val >= macd_signal and 20 < stoch_val < 80:
         side = "long"
-    # Short условия (смягчённые)
-    elif price_below and rsi < 52 and macd_val <= macd_signal and 10 < stoch_val < 90:
+    # Short условия
+    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal and 20 < stoch_val < 80:
         side = "short"
 
     if side is None:
@@ -718,15 +829,26 @@ def analyse_symbol(
 
     # 4. MTF подтверждение на 15m (тренд должен совпадать)
     # htf_close уже определён выше как c15[idx_15m]
+    
+    # ✅ УЛУЧШЕНИЕ №4: добавлена проверка направления импульса на HTF
+    htf_impulse_idx = len(c15) - 2
+    htf_impulse_close = c15[htf_impulse_idx]
+    htf_impulse_open = o15[htf_impulse_idx]
+    
     if side == "long":
         if htf_close < ema_htf * 0.998:
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: HTF нет long тренда. htf_close=%.6f htf_ema=%.6f",
                              symbol, htf_close, ema_htf)
             return None
-        if rsi_htf < 45:
+        if rsi_htf < 48:  # Ужесточено с 45
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: HTF RSI слишком низкий %.1f", symbol, rsi_htf)
+            return None
+        # НОВАЯ проверка: импульс на HTF тоже должен быть бычьим
+        if htf_impulse_close <= htf_impulse_open:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: HTF импульс не бычий", symbol)
             return None
     else:  # short
         if htf_close > ema_htf * 1.002:
@@ -734,9 +856,14 @@ def analyse_symbol(
                 logging.info("%s отклонён: HTF нет short тренда. htf_close=%.6f htf_ema=%.6f",
                              symbol, htf_close, ema_htf)
             return None
-        if rsi_htf > 55:
+        if rsi_htf > 52:  # Ужесточено с 55
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: HTF RSI слишком высокий %.1f", symbol, rsi_htf)
+            return None
+        # НОВАЯ проверка: импульс на HTF тоже должен быть медвежьим
+        if htf_impulse_close >= htf_impulse_open:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: HTF импульс не медвежий", symbol)
             return None
 
     # 5. BTC-фильтр (МЯГКИЙ - только жёсткие условия)
@@ -811,12 +938,25 @@ def analyse_symbol(
 
     leverage = 20
 
+    # ✅ УЛУЧШЕНИЕ №5: Фильтр минимального расстояния до тейка
+    tp_distance_pct = tp_pct  # Уже рассчитано выше
+    if tp_distance_pct < CONFIG["MIN_TP_DISTANCE_PCT"]:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s отклонён: тейк слишком близко %.3f%% (мин %.3f%%)",
+                         symbol, tp_distance_pct, CONFIG["MIN_TP_DISTANCE_PCT"])
+        return None
+
     # ✅ ПАТЧ №4: Защита от дублей
     signal_key = f"{symbol}_{side}_{impulse_time.isoformat()}"
     if signal_key in STATE.sent_signals_cache:
         if CONFIG.get("DEBUG_REASONS"):
             logging.info("%s отклонён: дубликат сигнала (уже отправлен)", symbol)
         return None
+
+    # ✅ НОВЫЙ: Расчёт score для выбора лучшего сигнала
+    # Учитываем: ATR (волатильность), MACD (импульс), расстояние от EMA (тренд)
+    distance_from_ema_pct = abs((close - ema) / ema) * 100.0
+    score = (atr_pct * 10.0) + (abs(macd_val) * 2.0) + (distance_from_ema_pct * 100.0)
 
     return {
         "symbol": symbol,
@@ -834,10 +974,12 @@ def analyse_symbol(
         "macd": macd_val,
         "stoch_rsi": stoch_val,
         "signal_key": signal_key,  # Для регистрации в кэше
+        "score": score,  # ✅ НОВЫЙ: для выбора лучшего
     }
 
 
 def scan_market_and_send_signals() -> int:
+    """✅ ИЗМЕНЕНО: Теперь собирает кандидатов и добавляет в очередь"""
     if STATE.is_risk_off():
         logging.info("Режим Risk OFF, сканирование пропускается.")
         return 0
@@ -851,65 +993,42 @@ def scan_market_and_send_signals() -> int:
     symbols = get_24h_volume_filter(symbols)
     logging.info("Анализ %d символов...", len(symbols))
 
-    active_subs = db_get_active_subscribers()
-    if not active_subs:
-        logging.info("Нет активных подписчиков, сигналы отправляться не будут.")
-        return 0
+    # ✅ НОВАЯ ЛОГИКА: Собираем кандидатов, не отправляем сразу
+    candidates: List[Dict[str, Any]] = []
     
-    signals_for_scan = 0
     for symbol in symbols:
-        if signals_for_scan >= CONFIG["MAX_SIGNALS_PER_SCAN"]:
-            break
-        if not STATE.can_send_signal(symbol):
-            continue
-        
         try:
             idea = analyse_symbol(symbol, btc_ctx)
         except Exception as e:
             logging.error("Ошибка анализа %s: %s", symbol, e)
             continue
             
-        if not idea:
-            continue
-        
-        text = build_signal_text(
-            symbol=idea["symbol"],
-            side=idea["side"],
-            leverage=idea["leverage"],
-            entry=idea["entry"],
-            take_profit=idea["take_profit"],
-            stop_loss=idea["stop_loss"],
-            timeframe=CONFIG["TIMEFRAME"],
-            ema200=idea["ema200"],
-            rsi=idea["rsi"],
-            impulse_time=idea["impulse_time"],
-            atr_pct=idea["atr_pct"],
-            macd=idea["macd"],
-            stoch_rsi=idea["stoch_rsi"],
-        )
-        
-        for cid in active_subs:
-            send_telegram_message(text, chat_id=str(cid), html=True)
-        
-        # Регистрируем сигнал в кэше для защиты от дублей
-        STATE.sent_signals_cache.add(idea.get("signal_key"))
-        STATE.register_signal(symbol)
-        signals_for_scan += 1
-        
-        try:
-            db_log_signal(idea, sent_to=len(active_subs))
-        except Exception as e:
-            logging.error("Не удалось записать сигнал в БД: %s", e)
-        
-        logging.info("Сигнал отправлен: %s %s", symbol, idea["side"])
-
+        if idea:
+            candidates.append(idea)
+    
+    if not candidates:
+        logging.info("Сканирование завершено. Кандидатов не найдено.")
+        return 0
+    
+    # ✅ НОВАЯ ЛОГИКА: Выбираем лучший сигнал по score
+    best_candidate = max(candidates, key=lambda x: x.get("score", 0))
+    
+    logging.info("Найдено кандидатов: %d. Лучший: %s %s (score: %.2f)",
+                 len(candidates),
+                 best_candidate["symbol"],
+                 best_candidate["side"],
+                 best_candidate.get("score", 0))
+    
+    # ✅ НОВАЯ ЛОГИКА: Добавляем в очередь вместо немедленной отправки
+    enqueue_signal(best_candidate)
+    
     logging.info(
-        "Сканирование завершено. Отправлено сигналов: %d, всего за день: %d/%d",
-        signals_for_scan,
+        "Сканирование завершено. В очереди сигналов: %d, отправлено за день: %d/%d",
+        len(SEND_QUEUE),
         STATE.signals_sent_today,
         CONFIG["MAX_SIGNALS_PER_DAY"],
     )
-    return signals_for_scan
+    return 1
 
 
 def handle_command(update: Dict[str, Any]) -> None:
@@ -1110,10 +1229,12 @@ def main_loop() -> None:
     logging.info("  - Таймфрейм: %s + %s", CONFIG["TIMEFRAME"], CONFIG["HTF_TIMEFRAME"])
     logging.info("  - Интервал сканирования: %d сек", CONFIG["SCAN_INTERVAL_SECONDS"])
     logging.info("  - Лимит сигналов в день: %d", CONFIG["MAX_SIGNALS_PER_DAY"])
+    logging.info("  - Лимит сигналов в час: %d", CONFIG["MAX_SIGNALS_PER_HOUR"])
+    logging.info("  - Макс. сигналов за скан: %d", CONFIG["MAX_SIGNALS_PER_SCAN"])
+    logging.info("  - Мин. интервал между отправками: %d сек", CONFIG["MIN_SEND_GAP_SECONDS"])
     logging.info("  - Risk/Reward: %.2f", CONFIG["RISK_REWARD"])
     logging.info("  - Мин. стоп: %.3f%%", CONFIG["MIN_STOP_PCT"])
     logging.info("  - Мин. ATR: %.3f%%", CONFIG["MIN_ATR_PCT"])
-    logging.info("  - Макс. сигналов за скан: %d", CONFIG["MAX_SIGNALS_PER_SCAN"])
     logging.info("  - BTC фильтр: %s", "ON" if CONFIG["BTC_FILTER_ENABLED"] else "OFF")
     logging.info("  - Cooldown на символ: %d сек", CONFIG["SYMBOL_COOLDOWN_SECONDS"])
 
@@ -1130,6 +1251,14 @@ def main_loop() -> None:
 
     while True:
         now = time.time()
+        
+        # ✅ НОВАЯ ЛОГИКА: Пытаемся отправить из очереди при каждой итерации
+        try:
+            try_send_from_queue()
+        except Exception as e:
+            logging.error("Ошибка при отправке из очереди: %s", e)
+        
+        # Сканируем рынок по расписанию
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
             logging.info("Начало сканирования рынка...")
             try:
@@ -1137,6 +1266,7 @@ def main_loop() -> None:
             except Exception as e:
                 logging.error("Ошибка при сканировании рынка: %s", e)
             last_scan_ts = time.time()
+        
         time.sleep(1)
 
 
