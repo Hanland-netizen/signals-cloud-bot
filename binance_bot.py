@@ -34,22 +34,31 @@ CONFIG: Dict[str, Any] = {
     "SCAN_INTERVAL_SECONDS": 600,  # 10 минут
     "MAX_SIGNALS_PER_DAY": 8,
     "MAX_SIGNALS_PER_HOUR": 2,
-    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ Только 1 лучший из скана
+    "MAX_SIGNALS_PER_SCAN": 1,  # Только 1 лучший из скана
     "MIN_SEND_GAP_SECONDS": 1800,  # 30 минут между отправками
     "MIN_QUOTE_VOLUME": 40_000_000,  # 40M USDT
     "RISK_REWARD": 1.7,
-    "MIN_ATR_PCT": 0.45,  # ✅ Убираем микроскальпы (было 0.25)
+    "MIN_ATR_PCT": 0.45,  # Убираем микроскальпы
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.30,  # ✅ Стоп не слишком близко (было 0.15)
+    "MIN_STOP_PCT": 0.30,  # Стоп не слишком близко
     "MAX_STOP_PCT": 1.20,
-    "MIN_TP_PCT": 0.70,  # ✅ НОВЫЙ: Минимальный тейк 0.7%
+    "MIN_TP_PCT": 0.70,  # Минимальный тейк 0.7%
     "STOP_BUFFER_LONG": 0.20,
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.15,
-    "MIN_TP_DISTANCE_PCT": 0.50,  # Устаревший, заменён на MIN_TP_PCT
-    "SYMBOL_COOLDOWN_SECONDS": 28800,  # ✅ 8 часов (было 1800)
+    "MIN_TP_DISTANCE_PCT": 0.50,  # Устаревший
+    "SYMBOL_COOLDOWN_SECONDS": 28800,  # 8 часов
     "BTC_FILTER_ENABLED": True,
     "DEBUG_REASONS": False,
+    
+    # ✅ Строгое подтверждение 15m (MTF)
+    "STRICT_MTF_CONFIRM": True,
+    "MTF_REQUIRE_TREND": True,        # 15m тоже по тренду (относительно EMA200)
+    "MTF_REQUIRE_MACD": True,         # MACD 15m в сторону сделки
+    "MTF_REQUIRE_RSI": True,          # RSI 15m в сторону сделки
+    "MTF_RSI_LONG_MIN": 50.0,         # long: RSI15m >= 52
+    "MTF_RSI_SHORT_MAX": 50.0,        # short: RSI15m <= 48
+    "MTF_NEUTRAL_BODY_PCT": 0.10,     # ✅ НОВЫЙ: порог для нейтральной свечи (doji)
 }
 
 
@@ -779,6 +788,9 @@ def analyse_symbol(
     atr_list = calc_atr(h5, l5, c5, 14)
     macd_line, signal_line = calc_macd(c5)
     stoch_rsi = calc_stoch_rsi(c5)
+    
+    # ✅ НОВЫЙ: MACD на 15m для строгого подтверждения
+    macd15_line, macd15_signal = calc_macd(c15, 12, 26, 9)
 
     if len(c5) < 210 or len(ema200_5m) < 1 or len(atr_list) < 1 or len(ema200_15m) < 1:
         return None
@@ -801,6 +813,10 @@ def analyse_symbol(
     ema_htf = ema200_15m[idx_15m]
     rsi_htf = rsi_15m[idx_15m]
     htf_close = c15[idx_15m]
+    
+    # ✅ НОВЫЙ: MACD 15m по закрытой свече
+    macd15 = macd15_line[idx_15m]
+    macd15_sig = macd15_signal[idx_15m]
 
     # 1. ATR фильтр
     if not (CONFIG["MIN_ATR_PCT"] <= atr_pct <= CONFIG["MAX_ATR_PCT"]):
@@ -854,44 +870,81 @@ def analyse_symbol(
                          symbol, close, ema, rsi, macd_val, stoch_val)
         return None
 
-    # 4. MTF подтверждение на 15m (тренд должен совпадать)
-    # htf_close уже определён выше как c15[idx_15m]
-    
-    # ✅ УЛУЧШЕНИЕ №4: добавлена проверка направления импульса на HTF
-    htf_impulse_idx = len(c15) - 2
-    htf_impulse_close = c15[htf_impulse_idx]
-    htf_impulse_open = o15[htf_impulse_idx]
-    
-    if side == "long":
-        if htf_close < ema_htf * 0.998:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF нет long тренда. htf_close=%.6f htf_ema=%.6f",
-                             symbol, htf_close, ema_htf)
-            return None
-        if rsi_htf < 48:  # Ужесточено с 45
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF RSI слишком низкий %.1f", symbol, rsi_htf)
-            return None
-        # НОВАЯ проверка: импульс на HTF тоже должен быть бычьим
-        if htf_impulse_close <= htf_impulse_open:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF импульс не бычий", symbol)
-            return None
-    else:  # short
-        if htf_close > ema_htf * 1.002:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF нет short тренда. htf_close=%.6f htf_ema=%.6f",
-                             symbol, htf_close, ema_htf)
-            return None
-        if rsi_htf > 52:  # Ужесточено с 55
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF RSI слишком высокий %.1f", symbol, rsi_htf)
-            return None
-        # НОВАЯ проверка: импульс на HTF тоже должен быть медвежьим
-        if htf_impulse_close >= htf_impulse_open:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF импульс не медвежий", symbol)
-            return None
+    # ✅ НОВЫЙ: Строгое подтверждение 15m (MTF)
+    if CONFIG.get("STRICT_MTF_CONFIRM", True):
+        # 1. Проверка тренда на 15m (цена относительно EMA200)
+        # Зачем: Убедиться, что 15m тоже в нужном направлении, не против тренда
+        if CONFIG.get("MTF_REQUIRE_TREND", True):
+            if side == "long" and htf_close < ema_htf:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF нет long тренда (strict). htf_close=%.6f < ema_htf=%.6f",
+                                 symbol, htf_close, ema_htf)
+                return None
+            if side == "short" and htf_close > ema_htf:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF нет short тренда (strict). htf_close=%.6f > ema_htf=%.6f",
+                                 symbol, htf_close, ema_htf)
+                return None
+        
+        # 2. Проверка RSI на 15m
+        # Зачем: Избежать входов в зонах перекупленности/перепроданности на старшем ТФ
+        if CONFIG.get("MTF_REQUIRE_RSI", True):
+            mtf_rsi_long_min = float(CONFIG.get("MTF_RSI_LONG_MIN", 52.0))
+            mtf_rsi_short_max = float(CONFIG.get("MTF_RSI_SHORT_MAX", 48.0))
+            
+            if side == "long" and rsi_htf < mtf_rsi_long_min:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF RSI слишком низкий для long (strict). rsi_htf=%.1f < %.1f",
+                                 symbol, rsi_htf, mtf_rsi_long_min)
+                return None
+            if side == "short" and rsi_htf > mtf_rsi_short_max:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF RSI слишком высокий для short (strict). rsi_htf=%.1f > %.1f",
+                                 symbol, rsi_htf, mtf_rsi_short_max)
+                return None
+        
+        # 3. Проверка MACD на 15m
+        # Зачем: Подтверждение импульса на старшем ТФ (MACD показывает силу движения)
+        if CONFIG.get("MTF_REQUIRE_MACD", True):
+            # Long: MACD выше сигнальной И >= 0 (бычий импульс)
+            if side == "long" and not (macd15 > macd15_sig and macd15 >= 0):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF MACD не подтверждает long (strict). macd15=%.5f sig=%.5f",
+                                 symbol, macd15, macd15_sig)
+                return None
+            # Short: MACD ниже сигнальной И <= 0 (медвежий импульс)
+            if side == "short" and not (macd15 < macd15_sig and macd15 <= 0):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF MACD не подтверждает short (strict). macd15=%.5f sig=%.5f",
+                                 symbol, macd15, macd15_sig)
+                return None
+        
+        # 4. Проверка импульсной свечи 15m (МЯГКО: не против, а не обязательно за)
+        # Зачем: Отсечь явно противоположные свечи, но разрешить нейтральные (doji)
+        htf_impulse_idx = len(c15) - 2
+        htf_impulse_close = c15[htf_impulse_idx]
+        htf_impulse_open = o15[htf_impulse_idx]
+        htf_body = abs(htf_impulse_close - htf_impulse_open)
+        htf_body_pct = (htf_body / htf_impulse_close) * 100.0
+        
+        neutral_threshold = float(CONFIG.get("MTF_NEUTRAL_BODY_PCT", 0.10))
+        
+        # Если тело слишком маленькое - считаем нейтральной (разрешено)
+        if htf_body_pct >= neutral_threshold:
+            # Тело значимое - проверяем направление
+            if side == "long" and htf_impulse_close < htf_impulse_open:
+                # Явно медвежья свеча при long - запрещаем
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF свеча явно медвежья при long. body_pct=%.3f%%",
+                                 symbol, htf_body_pct)
+                return None
+            if side == "short" and htf_impulse_close > htf_impulse_open:
+                # Явно бычья свеча при short - запрещаем
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF свеча явно бычья при short. body_pct=%.3f%%",
+                                 symbol, htf_body_pct)
+                return None
+        # Если тело < neutral_threshold - пропускаем (нейтральная свеча OK)
 
     # 5. BTC-фильтр (МЯГКИЙ - только жёсткие условия)
     if CONFIG["BTC_FILTER_ENABLED"]:
