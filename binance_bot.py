@@ -31,22 +31,23 @@ FOMC_DATES_UTC: List[datetime] = []
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
-    "SCAN_INTERVAL_SECONDS": 600,  # ✅ 10 минут (было 300)
+    "SCAN_INTERVAL_SECONDS": 600,  # 10 минут
     "MAX_SIGNALS_PER_DAY": 8,
     "MAX_SIGNALS_PER_HOUR": 2,
-    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ Топ-2 лучших кандидата
-    "MIN_SEND_GAP_SECONDS": 1800,  # ✅ 30 минут между отправками (было 600)
-    "MIN_QUOTE_VOLUME": 40_000_000,  # ✅ 40M USDT (было 20M)
+    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ Только 1 лучший из скана
+    "MIN_SEND_GAP_SECONDS": 1800,  # 30 минут между отправками
+    "MIN_QUOTE_VOLUME": 40_000_000,  # 40M USDT
     "RISK_REWARD": 1.7,
-    "MIN_ATR_PCT": 0.30,
+    "MIN_ATR_PCT": 0.45,  # ✅ Убираем микроскальпы (было 0.25)
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.15,
+    "MIN_STOP_PCT": 0.30,  # ✅ Стоп не слишком близко (было 0.15)
     "MAX_STOP_PCT": 1.20,
+    "MIN_TP_PCT": 0.70,  # ✅ НОВЫЙ: Минимальный тейк 0.7%
     "STOP_BUFFER_LONG": 0.20,
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.15,
-    "MIN_TP_DISTANCE_PCT": 0.50,
-    "SYMBOL_COOLDOWN_SECONDS": 1800,  # 30 минут
+    "MIN_TP_DISTANCE_PCT": 0.50,  # Устаревший, заменён на MIN_TP_PCT
+    "SYMBOL_COOLDOWN_SECONDS": 28800,  # ✅ 8 часов (было 1800)
     "BTC_FILTER_ENABLED": True,
     "DEBUG_REASONS": False,
 }
@@ -672,27 +673,36 @@ def calc_stoch_rsi(values: List[float], period: int = 14) -> List[float]:
 
 
 def get_btc_context() -> Dict[str, Any]:
+    """✅ ИСПРАВЛЕНО: Используем закрытую свечу [-2]"""
     kl = fetch_binance(
         "/fapi/v1/klines",
         {"symbol": "BTCUSDT", "interval": "5m", "limit": 300},
     )
     _, _, _, closes, _ = kline_to_floats(kl)
-    ema200 = calc_ema(closes, 200)[-2]
-    rsi = calc_rsi(closes, 14)[-2]
+    ema200 = calc_ema(closes, 200)
+    rsi = calc_rsi(closes, 14)
+    
+    # ✅ ИСПРАВЛЕНО: Берём закрытую свечу, а не текущую
+    idx = -2
+    price = closes[idx]
+    ema200_val = ema200[idx]
+    rsi_val = rsi[idx]
+    
+    # Для 24h change используем ticker (он корректен)
     ticker = fetch_binance("/fapi/v1/ticker/24hr", {"symbol": "BTCUSDT"})
-    price = float(ticker.get("lastPrice", closes[-2]))
     change_pct = float(ticker.get("priceChangePercent", 0.0))
+    
     ctx = {
         "price": price,
-        "ema200": ema200,
-        "rsi": rsi,
+        "ema200": ema200_val,
+        "rsi": rsi_val,
         "change_pct": change_pct,
     }
     logging.info(
         "BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
         price,
-        ema200,
-        rsi,
+        ema200_val,
+        rsi_val,
         change_pct,
     )
     return ctx
@@ -929,11 +939,14 @@ def analyse_symbol(
                              symbol, stop_loss, close)
             return None
         stop_pct = abs((close - stop_loss) / close) * 100.0
+        
+        # ✅ QUALITY: Проверка MIN_STOP_PCT
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: стоп %.3f%% вне диапазона %.3f—%.3f%%",
                              symbol, stop_pct, CONFIG["MIN_STOP_PCT"], CONFIG["MAX_STOP_PCT"])
             return None
+        
         take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((take_profit - close) / close) * 100.0
     else:  # short
@@ -945,22 +958,24 @@ def analyse_symbol(
                              symbol, stop_loss, close)
             return None
         stop_pct = abs((stop_loss - close) / close) * 100.0
+        
+        # ✅ QUALITY: Проверка MIN_STOP_PCT
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: стоп %.3f%% вне диапазона %.3f—%.3f%%",
                              symbol, stop_pct, CONFIG["MIN_STOP_PCT"], CONFIG["MAX_STOP_PCT"])
             return None
+        
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((close - take_profit) / close) * 100.0
 
     leverage = 20
 
-    # ✅ УЛУЧШЕНИЕ №5: Фильтр минимального расстояния до тейка
-    tp_distance_pct = tp_pct  # Уже рассчитано выше
-    if tp_distance_pct < CONFIG["MIN_TP_DISTANCE_PCT"]:
+    # ✅ QUALITY: Фильтр минимального тейка (главный против скальпов)
+    if tp_pct < CONFIG["MIN_TP_PCT"]:
         if CONFIG.get("DEBUG_REASONS"):
             logging.info("%s отклонён: тейк слишком близко %.3f%% (мин %.3f%%)",
-                         symbol, tp_distance_pct, CONFIG["MIN_TP_DISTANCE_PCT"])
+                         symbol, tp_pct, CONFIG["MIN_TP_PCT"])
         return None
 
     # ✅ ПАТЧ №4: Защита от дублей
@@ -996,7 +1011,7 @@ def analyse_symbol(
 
 
 def scan_market_and_send_signals() -> int:
-    """✅ ПЕРЕПИСАНО: Собирает кандидатов, выбирает топ-N, добавляет в очередь"""
+    """✅ ФИНАЛЬНАЯ ВЕРСИЯ: Только 1 лучший сигнал из скана"""
     if STATE.is_risk_off():
         logging.info("Режим Risk OFF, сканирование пропускается.")
         return 0
@@ -1030,44 +1045,38 @@ def scan_market_and_send_signals() -> int:
     # 2. Сортируем по score (лучшие сверху)
     candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
     
-    # 3. Берём топ-N лучших
-    max_to_enqueue = CONFIG["MAX_SIGNALS_PER_SCAN"]
-    top_candidates = candidates[:max_to_enqueue]
+    # 3. ✅ Берём ТОЛЬКО 1 лучший (MAX_SIGNALS_PER_SCAN = 1)
+    best_candidate = candidates[0]
     
-    logging.info("Найдено кандидатов: %d. Топ-%d (по score):",
-                 len(candidates), len(top_candidates))
+    logging.info("Найдено кандидатов: %d. Лучший: %s %s (score: %.2f, ATR: %.2f%%, тейк: %.2f%%)",
+                 len(candidates),
+                 best_candidate["symbol"],
+                 best_candidate["side"],
+                 best_candidate.get("score", 0),
+                 best_candidate.get("atr_pct", 0),
+                 best_candidate.get("tp_pct", 0))
     
-    for i, cand in enumerate(top_candidates, 1):
-        logging.info("  %d. %s %s (score: %.2f, ATR: %.2f%%, тейк: %.2f%%)",
-                     i, cand["symbol"], cand["side"],
-                     cand.get("score", 0),
-                     cand.get("atr_pct", 0),
-                     cand.get("tp_pct", 0))
+    # 4. Проверяем антидубликат ПЕРЕД добавлением в очередь
+    signal_key = best_candidate.get("signal_key")
+    if signal_key and signal_key in STATE.sent_signals_cache:
+        logging.info("Лучший сигнал %s уже был отправлен (дубликат), пропускаем", best_candidate["symbol"])
+        return 0
     
-    # 4. Добавляем в очередь
-    added_count = 0
-    for cand in top_candidates:
-        signal_key = cand.get("signal_key")
-        
-        # Проверяем антидубликат ПЕРЕД добавлением в очередь
-        if signal_key and signal_key in STATE.sent_signals_cache:
-            logging.info("Сигнал %s уже был отправлен (дубликат), пропускаем", cand["symbol"])
-            continue
-        
-        enqueue_signal(cand)
-        added_count += 1
+    # 5. Добавляем в очередь
+    enqueue_signal(best_candidate)
     
-    # 5. Пытаемся отправить из очереди сразу (если можем)
+    # 6. Пытаемся отправить из очереди сразу (если можем)
     try_send_from_queue()
     
     logging.info(
-        "Сканирование завершено. Добавлено в очередь: %d, в очереди всего: %d, отправлено за день: %d/%d",
-        added_count,
+        "Сканирование завершено. В очереди: %d, отправлено за день: %d/%d, за час: %d/%d",
         len(SEND_QUEUE),
         STATE.signals_sent_today,
         CONFIG["MAX_SIGNALS_PER_DAY"],
+        STATE.signals_sent_this_hour,
+        CONFIG["MAX_SIGNALS_PER_HOUR"],
     )
-    return added_count
+    return 1
 
 
 def handle_command(update: Dict[str, Any]) -> None:
