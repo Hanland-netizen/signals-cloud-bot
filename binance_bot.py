@@ -1,4 +1,47 @@
-import os
+# 3. Определение направления на 5m (БЕЗ StochRSI - только тренд и моментум)
+    price_above = close > ema * 1.0002
+    price_below = close < ema * 0.9998
+
+    side: Optional[str] = None
+    
+    # ✅ ИСПРАВЛЕНО: StochRSI убран из определения side
+    # Side определяется ТОЛЬКО по: цена/EMA200, RSI (диапазон), MACD (направление)
+    
+    # Long условия: тренд вверх + моментум
+    if price_above and 50 < rsi < 70 and macd_val >= macd_signal:
+        side = "long"
+    # Short условия: тренд вниз + моментум
+    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal:
+        side = "short"
+
+    if side is None:
+        if CONFIG.get("DEBUG_REASONS"):
+            logging.info("%s: нет направления. close=%.6f ema=%.6f rsi=%.1f macd=%.5f",
+                         symbol, close, ema, rsi, macd_val)
+        return None
+
+    # ✅ НОВЫЙ: Фильтры против late-entry (КРИТИЧНО для качества)
+    # Применяются ПОСЛЕ определения side, но ПЕРЕД всеми остальными проверками
+    
+    # 1. RSI фильтр: не шортить перепроданное, не лонговать перекупленное
+    # Зачем: Избежать входов после уже произошедшего движения (late entry)
+    if side == "short":
+        rsi_short_min = float(CONFIG.get("RSI_SHORT_MIN", 40.0))
+        if rsi < rsi_short_min:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: RSI слишком низкий для short (late entry). rsi=%.1f < %.1f",
+                             symbol, rsi, rsi_short_min)
+            return None
+    elif side == "long":
+        rsi_long_max = float(CONFIG.get("RSI_LONG_MAX", 60.0))
+        if rsi > rsi_long_max:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: RSI слишком высокий для long (late entry). rsi=%.1f > %.1f",
+                             symbol, rsi, rsi_long_max)
+            return None
+    
+    # 2. StochRSI фильтр: входить в зонах разворота, а не в середине движения
+    # Зачем: Short от перекупленности (>=import os
 import time
 import math
 import json
@@ -51,14 +94,20 @@ CONFIG: Dict[str, Any] = {
     "BTC_FILTER_ENABLED": True,
     "DEBUG_REASONS": False,
     
-    # ✅ Строгое подтверждение 15m (MTF)
+    # Строгое подтверждение 15m (MTF)
     "STRICT_MTF_CONFIRM": True,
     "MTF_REQUIRE_TREND": True,        # 15m тоже по тренду (относительно EMA200)
     "MTF_REQUIRE_MACD": True,         # MACD 15m в сторону сделки
     "MTF_REQUIRE_RSI": True,          # RSI 15m в сторону сделки
-    "MTF_RSI_LONG_MIN": 50.0,         # long: RSI15m >= 52
-    "MTF_RSI_SHORT_MAX": 50.0,        # short: RSI15m <= 48
-    "MTF_NEUTRAL_BODY_PCT": 0.10,     # ✅ НОВЫЙ: порог для нейтральной свечи (doji)
+    "MTF_RSI_LONG_MIN": 52.0,         # long: RSI15m >= 52
+    "MTF_RSI_SHORT_MAX": 48.0,        # short: RSI15m <= 48
+    "MTF_NEUTRAL_BODY_PCT": 0.10,     # порог для нейтральной свечи (doji)
+    
+    # ✅ НОВЫЙ: Фильтры против late-entry
+    "RSI_SHORT_MIN": 40.0,            # short запрещён если RSI < 40 (перепродано)
+    "RSI_LONG_MAX": 60.0,             # long запрещён если RSI > 60 (перекуплено)
+    "STOCH_SHORT_MIN": 70.0,          # short только если StochRSI >= 70 (от перекупленности)
+    "STOCH_LONG_MAX": 30.0,           # long только если StochRSI <= 30 (от перепроданности)
 }
 
 
@@ -858,10 +907,11 @@ def analyse_symbol(
     
     # ✅ УЛУЧШЕНИЕ №3: ужесточены RSI и StochRSI диапазоны
     # Long условия
-    if price_above and 50 < rsi < 70 and macd_val >= macd_signal and 20 < stoch_val < 80:
+    # Long условия
+    if price_above and 50 < rsi < 70 and macd_val >= macd_signal:
         side = "long"
     # Short условия
-    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal and 20 < stoch_val < 80:
+    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal:
         side = "short"
 
     if side is None:
@@ -869,6 +919,41 @@ def analyse_symbol(
             logging.info("%s: нет направления. close=%.6f ema=%.6f rsi=%.1f macd=%.5f stoch=%.1f",
                          symbol, close, ema, rsi, macd_val, stoch_val)
         return None
+
+    # ✅ НОВЫЙ: Фильтры против late-entry (применяются ПОСЛЕ определения side)
+    # 1. RSI фильтр: не шортить перепроданное, не лонговать перекупленное
+    # Зачем: Избежать входов после уже произошедшего движения (late entry)
+    if side == "short":
+        rsi_short_min = float(CONFIG.get("RSI_SHORT_MIN", 40.0))
+        if rsi < rsi_short_min:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: RSI слишком низкий для short (late entry). rsi=%.1f < %.1f",
+                             symbol, rsi, rsi_short_min)
+            return None
+    elif side == "long":
+        rsi_long_max = float(CONFIG.get("RSI_LONG_MAX", 60.0))
+        if rsi > rsi_long_max:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: RSI слишком высокий для long (late entry). rsi=%.1f > %.1f",
+                             symbol, rsi, rsi_long_max)
+            return None
+    
+    # 2. StochRSI фильтр: входить в зонах разворота, а не в середине движения
+    # Зачем: Short от перекупленности (>=70), Long от перепроданности (<=30) - лучшие точки входа
+    if side == "short":
+        stoch_short_min = float(CONFIG.get("STOCH_SHORT_MIN", 70.0))
+        if stoch_val < stoch_short_min:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: StochRSI слишком низкий для short (не от перекупленности). stoch=%.1f < %.1f",
+                             symbol, stoch_val, stoch_short_min)
+            return None
+    elif side == "long":
+        stoch_long_max = float(CONFIG.get("STOCH_LONG_MAX", 30.0))
+        if stoch_val > stoch_long_max:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: StochRSI слишком высокий для long (не от перепроданности). stoch=%.1f > %.1f",
+                             symbol, stoch_val, stoch_long_max)
+            return None
 
     # ✅ НОВЫЙ: Строгое подтверждение 15m (MTF)
     if CONFIG.get("STRICT_MTF_CONFIRM", True):
