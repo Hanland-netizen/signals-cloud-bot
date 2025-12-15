@@ -8,11 +8,11 @@
     # Side определяется ТОЛЬКО по: цена/EMA200, RSI (диапазон), MACD (направление)
     
     # Long условия: тренд вверх + моментум
-    if price_above and 50 < rsi < 70 and macd_val >= macd_signal:
+    if price_above and 50 < rsi < 70 and macd_val >= macd_signal and 20 < stoch_val < 80:
         side = "long"
     # Short условия: тренд вниз + моментум
-    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal:
-        side = "short"
+    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal and 20 < stoch_val < 80:
+       side = "short"
 
     if side is None:
         if CONFIG.get("DEBUG_REASONS"):
@@ -907,11 +907,10 @@ def analyse_symbol(
     
     # ✅ УЛУЧШЕНИЕ №3: ужесточены RSI и StochRSI диапазоны
     # Long условия
-    # Long условия
-    if price_above and 50 < rsi < 70 and macd_val >= macd_signal:
+    if price_above and 50 < rsi < 70 and macd_val >= macd_signal and 20 < stoch_val < 80:
         side = "long"
     # Short условия
-    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal:
+    elif price_below and 30 < rsi < 50 and macd_val <= macd_signal and 20 < stoch_val < 80:
         side = "short"
 
     if side is None:
@@ -1463,3 +1462,4 @@ if __name__ == "__main__":
         logging.info("Бот остановлен.")
     except Exception as e:
         logging.error("Критическая ошибка: %s", e)
+        
