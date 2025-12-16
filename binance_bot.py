@@ -31,37 +31,53 @@ FOMC_DATES_UTC: List[datetime] = []
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
-    "SCAN_INTERVAL_SECONDS": 300,  # 5 минут
-    "MAX_SIGNALS_PER_DAY": 8,  # ✅ Снижено с 10 до 8
-    "MAX_SIGNALS_PER_HOUR": 2,  # ✅ НОВЫЙ: макс 2 сигнала в час
-    "MAX_SIGNALS_PER_SCAN": 1,  # ✅ НОВЫЙ: из одного скана только 1 лучший
-    "MIN_SEND_GAP_SECONDS": 600,  # ✅ НОВЫЙ: мин. 10 минут между отправками
-    "MIN_QUOTE_VOLUME": 20_000_000,
+    "SCAN_INTERVAL_SECONDS": 600,  # 10 минут
+    "MAX_SIGNALS_PER_DAY": 8,
+    "MAX_SIGNALS_PER_HOUR": 2,
+    "MAX_SIGNALS_PER_SCAN": 1,  # Только 1 лучший из скана
+    "MIN_SEND_GAP_SECONDS": 1800,  # 30 минут между отправками
+    "MIN_QUOTE_VOLUME": 40_000_000,  # 40M USDT
     "RISK_REWARD": 1.7,
-    "MIN_ATR_PCT": 0.25,
+    "MIN_ATR_PCT": 0.45,  # Убираем микроскальпы
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.15,
+    "MIN_STOP_PCT": 0.30,  # Стоп не слишком близко
     "MAX_STOP_PCT": 1.20,
+    "MIN_TP_PCT": 0.70,  # Минимальный тейк 0.7%
     "STOP_BUFFER_LONG": 0.20,
     "STOP_BUFFER_SHORT": 0.20,
     "TP_EXTRA_PCT": 0.15,
-    "MIN_TP_DISTANCE_PCT": 0.50,
-    "SYMBOL_COOLDOWN_SECONDS": 1800,  # ✅ Увеличено с 900 до 30 минут
+    "MIN_TP_DISTANCE_PCT": 0.50,  # Устаревший
+    "SYMBOL_COOLDOWN_SECONDS": 28800,  # 8 часов
     "BTC_FILTER_ENABLED": True,
     "DEBUG_REASONS": False,
+    
+    # Строгое подтверждение 15m (MTF)
+    "STRICT_MTF_CONFIRM": True,
+    "MTF_REQUIRE_TREND": True,        # 15m тоже по тренду (относительно EMA200)
+    "MTF_REQUIRE_MACD": True,         # MACD 15m в сторону сделки
+    "MTF_REQUIRE_RSI": True,          # RSI 15m в сторону сделки
+    "MTF_RSI_LONG_MIN": 52.0,         # long: RSI15m >= 52
+    "MTF_RSI_SHORT_MAX": 48.0,        # short: RSI15m <= 48
+    "MTF_NEUTRAL_BODY_PCT": 0.10,     # порог для нейтральной свечи (doji)
+    
+    # ✅ НОВЫЙ: Фильтры против late-entry
+    "RSI_SHORT_MIN": 40.0,            # short запрещён если RSI < 40 (перепродано)
+    "RSI_LONG_MAX": 60.0,             # long запрещён если RSI > 60 (перекуплено)
+    "STOCH_SHORT_MIN": 70.0,          # short только если StochRSI >= 70 (от перекупленности)
+    "STOCH_LONG_MAX": 30.0,           # long только если StochRSI <= 30 (от перепроданности)
 }
 
 
 class SignalState:
     def __init__(self) -> None:
         self.signals_sent_today: int = 0
-        self.signals_sent_this_hour: int = 0  # ✅ НОВЫЙ: счётчик за час
+        self.signals_sent_this_hour: int = 0
         self.total_signals_sent: int = 0
         self.last_reset_date: date = date.today()
-        self.last_hour_reset: int = datetime.now().hour  # ✅ НОВЫЙ: последний сброс часа
+        self.last_hour_reset: int = datetime.now().hour
         self.symbol_last_signal_ts: Dict[str, float] = {}
         self.risk_off: bool = False
-        self.sent_signals_cache: set = set()  # Защита от дублей
+        self.sent_signals_cache: set = set()
 
     def reset_if_new_day(self) -> None:
         today = date.today()
@@ -69,39 +85,44 @@ class SignalState:
             logging.info("Новый день, обнуляем счётчики сигналов.")
             self.signals_sent_today = 0
             self.last_reset_date = today
-            self.sent_signals_cache.clear()  # Очищаем кэш при смене дня
+            self.sent_signals_cache.clear()
 
     def reset_if_new_hour(self) -> None:
-        """✅ НОВЫЙ: Сбрасываем часовой счётчик при смене часа"""
+        """Сбрасываем часовой счётчик при смене часа"""
         current_hour = datetime.now().hour
         if current_hour != self.last_hour_reset:
             logging.info("Новый час, обнуляем часовой счётчик. Было: %d", self.signals_sent_this_hour)
             self.signals_sent_this_hour = 0
             self.last_hour_reset = current_hour
 
-    def can_send_signal(self, symbol: str) -> bool:
+    def can_send_global(self) -> bool:
+        """✅ НОВАЯ ФУНКЦИЯ: Проверяет только глобальные лимиты (день/час)"""
         self.reset_if_new_day()
-        self.reset_if_new_hour()  # ✅ НОВЫЙ
+        self.reset_if_new_hour()
         
         if self.signals_sent_today >= CONFIG["MAX_SIGNALS_PER_DAY"]:
             return False
         
-        # ✅ НОВЫЙ: проверка часового лимита
         if self.signals_sent_this_hour >= CONFIG["MAX_SIGNALS_PER_HOUR"]:
             return False
         
+        return True
+
+    def can_send_symbol(self, symbol: str) -> bool:
+        """✅ НОВАЯ ФУНКЦИЯ: Проверяет только cooldown по символу"""
         now = time.time()
         last_ts = self.symbol_last_signal_ts.get(symbol)
-        if (
-            last_ts is not None
-            and now - last_ts < CONFIG["SYMBOL_COOLDOWN_SECONDS"]
-        ):
+        if last_ts is not None and now - last_ts < CONFIG["SYMBOL_COOLDOWN_SECONDS"]:
             return False
         return True
 
+    def can_send_signal(self, symbol: str) -> bool:
+        """✅ УСТАРЕВШАЯ: Для обратной совместимости. Используйте can_send_global() и can_send_symbol()"""
+        return self.can_send_global() and self.can_send_symbol(symbol)
+
     def register_signal(self, symbol: str) -> None:
         self.signals_sent_today += 1
-        self.signals_sent_this_hour += 1  # ✅ НОВЫЙ
+        self.signals_sent_this_hour += 1
         self.total_signals_sent += 1
         self.symbol_last_signal_ts[symbol] = time.time()
 
@@ -114,7 +135,7 @@ class SignalState:
 
 STATE = SignalState()
 
-# ✅ НОВЫЙ: Очередь отправки сигналов
+# ✅ Очередь отправки сигналов
 SEND_QUEUE: deque = deque()
 LAST_SEND_TS: float = 0.0
 
@@ -134,38 +155,48 @@ def enqueue_signal(signal_data: Dict[str, Any]) -> None:
 
 
 def try_send_from_queue() -> None:
-    """✅ НОВАЯ ФУНКЦИЯ: Пытается отправить сигнал из очереди с учётом лимитов"""
+    """✅ ПЕРЕПИСАНО: Отправляет сигнал из очереди с правильными проверками"""
     global SEND_QUEUE, LAST_SEND_TS
     
     if not SEND_QUEUE:
         return
     
-    # Проверяем временной интервал
     now = time.time()
+    
+    # 1. Проверяем временной интервал (MIN_SEND_GAP_SECONDS)
     if now - LAST_SEND_TS < CONFIG["MIN_SEND_GAP_SECONDS"]:
         return
     
-    # Проверяем лимиты
-    if not STATE.can_send_signal(""):
-        logging.info("Достигнут лимит сигналов (день: %d/%d, час: %d/%d). Очередь: %d",
+    # 2. Проверяем глобальные лимиты (день/час)
+    if not STATE.can_send_global():
+        logging.info("Достигнут глобальный лимит (день: %d/%d, час: %d/%d). Очередь: %d",
                      STATE.signals_sent_today, CONFIG["MAX_SIGNALS_PER_DAY"],
                      STATE.signals_sent_this_hour, CONFIG["MAX_SIGNALS_PER_HOUR"],
                      len(SEND_QUEUE))
         return
     
-    # Берём первый сигнал из очереди
+    # 3. Берём первый сигнал из очереди
     signal_data = SEND_QUEUE.popleft()
-    
-    # Проверяем cooldown для символа
     symbol = signal_data["symbol"]
-    if not STATE.can_send_signal(symbol):
-        logging.info("Символ %s ещё в cooldown, пропускаем", symbol)
+    signal_key = signal_data.get("signal_key")
+    
+    # 4. Проверяем антидубликат (может быть уже отправлен)
+    if signal_key and signal_key in STATE.sent_signals_cache:
+        logging.info("Сигнал %s уже был отправлен (дубликат), пропускаем", symbol)
+        return  # НЕ возвращаем в очередь
+    
+    # 5. Проверяем cooldown для символа
+    if not STATE.can_send_symbol(symbol):
+        # ✅ ИСПРАВЛЕНО: Возвращаем в КОНЕЦ очереди, чтобы не блокировать
+        SEND_QUEUE.append(signal_data)
+        logging.info("Символ %s ещё в cooldown, возвращён в конец очереди (в очереди: %d)",
+                     symbol, len(SEND_QUEUE))
         return
     
-    # Отправляем сигнал
+    # 6. Отправляем сигнал
     active_subs = db_get_active_subscribers()
     if not active_subs:
-        logging.info("Нет активных подписчиков")
+        logging.info("Нет активных подписчиков, сигнал пропущен")
         return
     
     text = build_signal_text(
@@ -187,18 +218,20 @@ def try_send_from_queue() -> None:
     for cid in active_subs:
         send_telegram_message(text, chat_id=str(cid), html=True)
     
-    # Регистрируем отправку
-    STATE.sent_signals_cache.add(signal_data.get("signal_key"))
+    # 7. Регистрируем отправку
+    if signal_key:  # ✅ ИСПРАВЛЕНО: добавляем только если key truthy
+        STATE.sent_signals_cache.add(signal_key)
     STATE.register_signal(symbol)
     LAST_SEND_TS = now
     
+    # 8. Логируем в БД
     try:
         db_log_signal(signal_data, sent_to=len(active_subs))
     except Exception as e:
         logging.error("Не удалось записать сигнал в БД: %s", e)
     
-    logging.info("✅ Сигнал отправлен: %s %s (осталось в очереди: %d)",
-                 symbol, signal_data["side"], len(SEND_QUEUE))
+    logging.info("✅ Сигнал отправлен: %s %s (score: %.2f, осталось в очереди: %d)",
+                 symbol, signal_data["side"], signal_data.get("score", 0), len(SEND_QUEUE))
 
 
 def db_connect():
@@ -655,27 +688,36 @@ def calc_stoch_rsi(values: List[float], period: int = 14) -> List[float]:
 
 
 def get_btc_context() -> Dict[str, Any]:
+    """✅ ИСПРАВЛЕНО: Используем закрытую свечу [-2]"""
     kl = fetch_binance(
         "/fapi/v1/klines",
         {"symbol": "BTCUSDT", "interval": "5m", "limit": 300},
     )
     _, _, _, closes, _ = kline_to_floats(kl)
-    ema200 = calc_ema(closes, 200)[-1]
-    rsi = calc_rsi(closes, 14)[-1]
+    ema200 = calc_ema(closes, 200)
+    rsi = calc_rsi(closes, 14)
+    
+    # ✅ ИСПРАВЛЕНО: Берём закрытую свечу, а не текущую
+    idx = -2
+    price = closes[idx]
+    ema200_val = ema200[idx]
+    rsi_val = rsi[idx]
+    
+    # Для 24h change используем ticker (он корректен)
     ticker = fetch_binance("/fapi/v1/ticker/24hr", {"symbol": "BTCUSDT"})
-    price = float(ticker.get("lastPrice", closes[-1]))
     change_pct = float(ticker.get("priceChangePercent", 0.0))
+    
     ctx = {
         "price": price,
-        "ema200": ema200,
-        "rsi": rsi,
+        "ema200": ema200_val,
+        "rsi": rsi_val,
         "change_pct": change_pct,
     }
     logging.info(
         "BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
         price,
-        ema200,
-        rsi,
+        ema200_val,
+        rsi_val,
         change_pct,
     )
     return ctx
@@ -752,6 +794,9 @@ def analyse_symbol(
     atr_list = calc_atr(h5, l5, c5, 14)
     macd_line, signal_line = calc_macd(c5)
     stoch_rsi = calc_stoch_rsi(c5)
+    
+    # ✅ НОВЫЙ: MACD на 15m для строгого подтверждения
+    macd15_line, macd15_signal = calc_macd(c15, 12, 26, 9)
 
     if len(c5) < 210 or len(ema200_5m) < 1 or len(atr_list) < 1 or len(ema200_15m) < 1:
         return None
@@ -774,6 +819,10 @@ def analyse_symbol(
     ema_htf = ema200_15m[idx_15m]
     rsi_htf = rsi_15m[idx_15m]
     htf_close = c15[idx_15m]
+    
+    # ✅ НОВЫЙ: MACD 15m по закрытой свече
+    macd15 = macd15_line[idx_15m]
+    macd15_sig = macd15_signal[idx_15m]
 
     # 1. ATR фильтр
     if not (CONFIG["MIN_ATR_PCT"] <= atr_pct <= CONFIG["MAX_ATR_PCT"]):
@@ -815,6 +864,7 @@ def analyse_symbol(
     
     # ✅ УЛУЧШЕНИЕ №3: ужесточены RSI и StochRSI диапазоны
     # Long условия
+    # Long условия
     if price_above and 50 < rsi < 70 and macd_val >= macd_signal:
         side = "long"
     # Short условия
@@ -827,44 +877,116 @@ def analyse_symbol(
                          symbol, close, ema, rsi, macd_val, stoch_val)
         return None
 
-    # 4. MTF подтверждение на 15m (тренд должен совпадать)
-    # htf_close уже определён выше как c15[idx_15m]
+    # ✅ НОВЫЙ: Фильтры против late-entry (применяются ПОСЛЕ определения side)
+    # 1. RSI фильтр: не шортить перепроданное, не лонговать перекупленное
+    # Зачем: Избежать входов после уже произошедшего движения (late entry)
+    if side == "short":
+        rsi_short_min = float(CONFIG.get("RSI_SHORT_MIN", 40.0))
+        if rsi < rsi_short_min:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: RSI слишком низкий для short (late entry). rsi=%.1f < %.1f",
+                             symbol, rsi, rsi_short_min)
+            return None
+    elif side == "long":
+        rsi_long_max = float(CONFIG.get("RSI_LONG_MAX", 60.0))
+        if rsi > rsi_long_max:
+            if CONFIG.get("DEBUG_REASONS"):
+                logging.info("%s отклонён: RSI слишком высокий для long (late entry). rsi=%.1f > %.1f",
+                             symbol, rsi, rsi_long_max)
+            return None
     
-    # ✅ УЛУЧШЕНИЕ №4: добавлена проверка направления импульса на HTF
-    htf_impulse_idx = len(c15) - 2
-    htf_impulse_close = c15[htf_impulse_idx]
-    htf_impulse_open = o15[htf_impulse_idx]
-    
-    if side == "long":
-        if htf_close < ema_htf * 0.998:
+    # 2. StochRSI фильтр: входить в зонах разворота, а не в середине движения
+    # Зачем: Short от перекупленности (>=70), Long от перепроданности (<=30) - лучшие точки входа
+    if side == "short":
+        stoch_short_min = float(CONFIG.get("STOCH_SHORT_MIN", 70.0))
+        if stoch_val < stoch_short_min:
             if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF нет long тренда. htf_close=%.6f htf_ema=%.6f",
-                             symbol, htf_close, ema_htf)
+                logging.info("%s отклонён: StochRSI слишком низкий для short (не от перекупленности). stoch=%.1f < %.1f",
+                             symbol, stoch_val, stoch_short_min)
             return None
-        if rsi_htf < 48:  # Ужесточено с 45
+    elif side == "long":
+        stoch_long_max = float(CONFIG.get("STOCH_LONG_MAX", 30.0))
+        if stoch_val > stoch_long_max:
             if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF RSI слишком низкий %.1f", symbol, rsi_htf)
+                logging.info("%s отклонён: StochRSI слишком высокий для long (не от перепроданности). stoch=%.1f > %.1f",
+                             symbol, stoch_val, stoch_long_max)
             return None
-        # НОВАЯ проверка: импульс на HTF тоже должен быть бычьим
-        if htf_impulse_close <= htf_impulse_open:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF импульс не бычий", symbol)
-            return None
-    else:  # short
-        if htf_close > ema_htf * 1.002:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF нет short тренда. htf_close=%.6f htf_ema=%.6f",
-                             symbol, htf_close, ema_htf)
-            return None
-        if rsi_htf > 52:  # Ужесточено с 55
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF RSI слишком высокий %.1f", symbol, rsi_htf)
-            return None
-        # НОВАЯ проверка: импульс на HTF тоже должен быть медвежьим
-        if htf_impulse_close >= htf_impulse_open:
-            if CONFIG.get("DEBUG_REASONS"):
-                logging.info("%s отклонён: HTF импульс не медвежий", symbol)
-            return None
+
+    # ✅ НОВЫЙ: Строгое подтверждение 15m (MTF)
+    if CONFIG.get("STRICT_MTF_CONFIRM", True):
+        # 1. Проверка тренда на 15m (цена относительно EMA200)
+        # Зачем: Убедиться, что 15m тоже в нужном направлении, не против тренда
+        if CONFIG.get("MTF_REQUIRE_TREND", True):
+            if side == "long" and htf_close < ema_htf:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF нет long тренда (strict). htf_close=%.6f < ema_htf=%.6f",
+                                 symbol, htf_close, ema_htf)
+                return None
+            if side == "short" and htf_close > ema_htf:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF нет short тренда (strict). htf_close=%.6f > ema_htf=%.6f",
+                                 symbol, htf_close, ema_htf)
+                return None
+        
+        # 2. Проверка RSI на 15m
+        # Зачем: Избежать входов в зонах перекупленности/перепроданности на старшем ТФ
+        if CONFIG.get("MTF_REQUIRE_RSI", True):
+            mtf_rsi_long_min = float(CONFIG.get("MTF_RSI_LONG_MIN", 52.0))
+            mtf_rsi_short_max = float(CONFIG.get("MTF_RSI_SHORT_MAX", 48.0))
+            
+            if side == "long" and rsi_htf < mtf_rsi_long_min:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF RSI слишком низкий для long (strict). rsi_htf=%.1f < %.1f",
+                                 symbol, rsi_htf, mtf_rsi_long_min)
+                return None
+            if side == "short" and rsi_htf > mtf_rsi_short_max:
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF RSI слишком высокий для short (strict). rsi_htf=%.1f > %.1f",
+                                 symbol, rsi_htf, mtf_rsi_short_max)
+                return None
+        
+        # 3. Проверка MACD на 15m
+        # Зачем: Подтверждение импульса на старшем ТФ (MACD показывает силу движения)
+        if CONFIG.get("MTF_REQUIRE_MACD", True):
+            # Long: MACD выше сигнальной И >= 0 (бычий импульс)
+            if side == "long" and not (macd15 > macd15_sig and macd15 >= 0):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF MACD не подтверждает long (strict). macd15=%.5f sig=%.5f",
+                                 symbol, macd15, macd15_sig)
+                return None
+            # Short: MACD ниже сигнальной И <= 0 (медвежий импульс)
+            if side == "short" and not (macd15 < macd15_sig and macd15 <= 0):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF MACD не подтверждает short (strict). macd15=%.5f sig=%.5f",
+                                 symbol, macd15, macd15_sig)
+                return None
+        
+        # 4. Проверка импульсной свечи 15m (МЯГКО: не против, а не обязательно за)
+        # Зачем: Отсечь явно противоположные свечи, но разрешить нейтральные (doji)
+        htf_impulse_idx = len(c15) - 2
+        htf_impulse_close = c15[htf_impulse_idx]
+        htf_impulse_open = o15[htf_impulse_idx]
+        htf_body = abs(htf_impulse_close - htf_impulse_open)
+        htf_body_pct = (htf_body / htf_impulse_close) * 100.0
+        
+        neutral_threshold = float(CONFIG.get("MTF_NEUTRAL_BODY_PCT", 0.10))
+        
+        # Если тело слишком маленькое - считаем нейтральной (разрешено)
+        if htf_body_pct >= neutral_threshold:
+            # Тело значимое - проверяем направление
+            if side == "long" and htf_impulse_close < htf_impulse_open:
+                # Явно медвежья свеча при long - запрещаем
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF свеча явно медвежья при long. body_pct=%.3f%%",
+                                 symbol, htf_body_pct)
+                return None
+            if side == "short" and htf_impulse_close > htf_impulse_open:
+                # Явно бычья свеча при short - запрещаем
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: HTF свеча явно бычья при short. body_pct=%.3f%%",
+                                 symbol, htf_body_pct)
+                return None
+        # Если тело < neutral_threshold - пропускаем (нейтральная свеча OK)
 
     # 5. BTC-фильтр (МЯГКИЙ - только жёсткие условия)
     if CONFIG["BTC_FILTER_ENABLED"]:
@@ -912,11 +1034,14 @@ def analyse_symbol(
                              symbol, stop_loss, close)
             return None
         stop_pct = abs((close - stop_loss) / close) * 100.0
+        
+        # ✅ QUALITY: Проверка MIN_STOP_PCT
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: стоп %.3f%% вне диапазона %.3f—%.3f%%",
                              symbol, stop_pct, CONFIG["MIN_STOP_PCT"], CONFIG["MAX_STOP_PCT"])
             return None
+        
         take_profit = close + (close - stop_loss) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((take_profit - close) / close) * 100.0
     else:  # short
@@ -928,22 +1053,24 @@ def analyse_symbol(
                              symbol, stop_loss, close)
             return None
         stop_pct = abs((stop_loss - close) / close) * 100.0
+        
+        # ✅ QUALITY: Проверка MIN_STOP_PCT
         if not (CONFIG["MIN_STOP_PCT"] <= stop_pct <= CONFIG["MAX_STOP_PCT"]):
             if CONFIG.get("DEBUG_REASONS"):
                 logging.info("%s отклонён: стоп %.3f%% вне диапазона %.3f—%.3f%%",
                              symbol, stop_pct, CONFIG["MIN_STOP_PCT"], CONFIG["MAX_STOP_PCT"])
             return None
+        
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((close - take_profit) / close) * 100.0
 
     leverage = 20
 
-    # ✅ УЛУЧШЕНИЕ №5: Фильтр минимального расстояния до тейка
-    tp_distance_pct = tp_pct  # Уже рассчитано выше
-    if tp_distance_pct < CONFIG["MIN_TP_DISTANCE_PCT"]:
+    # ✅ QUALITY: Фильтр минимального тейка (главный против скальпов)
+    if tp_pct < CONFIG["MIN_TP_PCT"]:
         if CONFIG.get("DEBUG_REASONS"):
             logging.info("%s отклонён: тейк слишком близко %.3f%% (мин %.3f%%)",
-                         symbol, tp_distance_pct, CONFIG["MIN_TP_DISTANCE_PCT"])
+                         symbol, tp_pct, CONFIG["MIN_TP_PCT"])
         return None
 
     # ✅ ПАТЧ №4: Защита от дублей
@@ -979,7 +1106,7 @@ def analyse_symbol(
 
 
 def scan_market_and_send_signals() -> int:
-    """✅ ИЗМЕНЕНО: Теперь собирает кандидатов и добавляет в очередь"""
+    """✅ ФИНАЛЬНАЯ ВЕРСИЯ: Только 1 лучший сигнал из скана"""
     if STATE.is_risk_off():
         logging.info("Режим Risk OFF, сканирование пропускается.")
         return 0
@@ -993,7 +1120,7 @@ def scan_market_and_send_signals() -> int:
     symbols = get_24h_volume_filter(symbols)
     logging.info("Анализ %d символов...", len(symbols))
 
-    # ✅ НОВАЯ ЛОГИКА: Собираем кандидатов, не отправляем сразу
+    # 1. Собираем ВСЕ кандидатов
     candidates: List[Dict[str, Any]] = []
     
     for symbol in symbols:
@@ -1010,23 +1137,39 @@ def scan_market_and_send_signals() -> int:
         logging.info("Сканирование завершено. Кандидатов не найдено.")
         return 0
     
-    # ✅ НОВАЯ ЛОГИКА: Выбираем лучший сигнал по score
-    best_candidate = max(candidates, key=lambda x: x.get("score", 0))
+    # 2. Сортируем по score (лучшие сверху)
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
     
-    logging.info("Найдено кандидатов: %d. Лучший: %s %s (score: %.2f)",
+    # 3. ✅ Берём ТОЛЬКО 1 лучший (MAX_SIGNALS_PER_SCAN = 1)
+    best_candidate = candidates[0]
+    
+    logging.info("Найдено кандидатов: %d. Лучший: %s %s (score: %.2f, ATR: %.2f%%, тейк: %.2f%%)",
                  len(candidates),
                  best_candidate["symbol"],
                  best_candidate["side"],
-                 best_candidate.get("score", 0))
+                 best_candidate.get("score", 0),
+                 best_candidate.get("atr_pct", 0),
+                 best_candidate.get("tp_pct", 0))
     
-    # ✅ НОВАЯ ЛОГИКА: Добавляем в очередь вместо немедленной отправки
+    # 4. Проверяем антидубликат ПЕРЕД добавлением в очередь
+    signal_key = best_candidate.get("signal_key")
+    if signal_key and signal_key in STATE.sent_signals_cache:
+        logging.info("Лучший сигнал %s уже был отправлен (дубликат), пропускаем", best_candidate["symbol"])
+        return 0
+    
+    # 5. Добавляем в очередь
     enqueue_signal(best_candidate)
     
+    # 6. Пытаемся отправить из очереди сразу (если можем)
+    try_send_from_queue()
+    
     logging.info(
-        "Сканирование завершено. В очереди сигналов: %d, отправлено за день: %d/%d",
+        "Сканирование завершено. В очереди: %d, отправлено за день: %d/%d, за час: %d/%d",
         len(SEND_QUEUE),
         STATE.signals_sent_today,
         CONFIG["MAX_SIGNALS_PER_DAY"],
+        STATE.signals_sent_this_hour,
+        CONFIG["MAX_SIGNALS_PER_HOUR"],
     )
     return 1
 
