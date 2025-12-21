@@ -28,6 +28,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 FOMC_DATES_UTC: List[datetime] = []
 
+# Кэш параметров символов (tickSize/stepSize) из exchangeInfo
+SYMBOL_TICK_SIZE: Dict[str, float] = {}
+SYMBOL_STEP_SIZE: Dict[str, float] = {}
+
+
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
@@ -38,6 +43,8 @@ CONFIG: Dict[str, Any] = {
     "MIN_SEND_GAP_SECONDS": 1800,  # 30 минут между отправками
     "MIN_QUOTE_VOLUME": 40_000_000,  # 40M USDT
     "RISK_REWARD": 1.7,
+    "LEVERAGE": 15,  # стандартное плечо для сигналов
+
     "MIN_ATR_PCT": 0.45,  # Убираем микроскальпы
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.30,  # Стоп не слишком близко
@@ -547,12 +554,84 @@ def fetch_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     raise RuntimeError(f"Не удалось получить данные с Binance: {path}")
 
 
+def _get_tick_size(symbol: str) -> float:
+    """Получить tickSize из кэша, при необходимости обновить exchangeInfo."""
+    ts = SYMBOL_TICK_SIZE.get(symbol)
+    if ts and ts > 0:
+        return ts
+    # fallback: обновим кэш один раз
+    try:
+        data = fetch_binance("/fapi/v1/exchangeInfo")
+        for s in data.get("symbols", []):
+            sym = s.get("symbol")
+            if not sym:
+                continue
+            try:
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER":
+                        SYMBOL_TICK_SIZE[sym] = float(f.get("tickSize", 0.0))
+                    elif f.get("filterType") == "LOT_SIZE":
+                        SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
+            except Exception:
+                continue
+        ts = SYMBOL_TICK_SIZE.get(symbol)
+        return ts if ts and ts > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def round_price_to_tick(symbol: str, price: float) -> float:
+    """Округляет цену к шагу цены (tickSize) Binance Futures."""
+    tick = _get_tick_size(symbol)
+    if not tick or tick <= 0:
+        # безопасный fallback: 1e-6
+        return round(price, 6)
+    # округление вниз к тик-спейсу (чтобы лимит/стоп не ушли за шаг)
+    steps = math.floor(price / tick)
+    rounded = steps * tick
+    # устранение плавающей ошибки
+    prec = max(0, int(round(-math.log10(tick), 0))) if tick < 1 else 0
+    return float(f"{rounded:.{prec}f}")
+
+
+def _fix_prices_for_side(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float) -> Tuple[float, float, float]:
+    """Гарантирует корректный порядок цен после округлений."""
+    entry_r = round_price_to_tick(symbol, entry)
+    sl_r = round_price_to_tick(symbol, stop_loss)
+    tp_r = round_price_to_tick(symbol, take_profit)
+
+    if side == "long":
+        # должно быть: SL < ENTRY < TP
+        if sl_r >= entry_r:
+            sl_r = round_price_to_tick(symbol, entry_r * (1.0 - 0.001))  # -0.1% fallback
+        if tp_r <= entry_r:
+            tp_r = round_price_to_tick(symbol, entry_r * (1.0 + 0.0017))  # +0.17% fallback
+    else:
+        # short: TP < ENTRY < SL
+        if sl_r <= entry_r:
+            sl_r = round_price_to_tick(symbol, entry_r * (1.0 + 0.001))  # +0.1% fallback
+        if tp_r >= entry_r:
+            tp_r = round_price_to_tick(symbol, entry_r * (1.0 - 0.0017))  # -0.17% fallback
+
+    return entry_r, sl_r, tp_r
+
+
 def get_usdt_perp_symbols() -> List[str]:
     data = fetch_binance("/fapi/v1/exchangeInfo")
     symbols = []
     for s in data.get("symbols", []):
         if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT":
-            symbols.append(s["symbol"])
+            sym = s["symbol"]
+            symbols.append(sym)
+            # Сохраняем параметры цены/кол-ва для корректного округления
+            try:
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER":
+                        SYMBOL_TICK_SIZE[sym] = float(f.get("tickSize", 0.0))
+                    elif f.get("filterType") == "LOT_SIZE":
+                        SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
+            except Exception:
+                pass
     logging.info("Найдено %d USDT-M PERPETUAL символов", len(symbols))
     return symbols
 
@@ -1063,9 +1142,7 @@ def analyse_symbol(
         
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((close - take_profit) / close) * 100.0
-
-    leverage = 20
-
+    leverage = int(CONFIG.get("LEVERAGE", 15))
     # ✅ QUALITY: Фильтр минимального тейка (главный против скальпов)
     if tp_pct < CONFIG["MIN_TP_PCT"]:
         if CONFIG.get("DEBUG_REASONS"):
@@ -1085,13 +1162,16 @@ def analyse_symbol(
     distance_from_ema_pct = abs((close - ema) / ema) * 100.0
     score = (atr_pct * 10.0) + (abs(macd_val) * 2.0) + (distance_from_ema_pct * 100.0)
 
+    # ✅ Округляем entry/SL/TP к tickSize Binance и страхуем порядок цен
+    entry_r, stop_r, tp_r = _fix_prices_for_side(symbol, side, close, stop_loss, take_profit)
+
     return {
         "symbol": symbol,
         "side": side,
         "leverage": leverage,
-        "entry": close,
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
+        "entry": entry_r,
+        "take_profit": tp_r,
+        "stop_loss": stop_r,
         "ema200": ema,
         "rsi": rsi,
         "impulse_time": impulse_time,
