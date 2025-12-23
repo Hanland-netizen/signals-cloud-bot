@@ -28,11 +28,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 FOMC_DATES_UTC: List[datetime] = []
 
-# Кэш параметров символов (tickSize/stepSize) из exchangeInfo
-SYMBOL_TICK_SIZE: Dict[str, float] = {}
-SYMBOL_STEP_SIZE: Dict[str, float] = {}
-
-
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
@@ -43,8 +38,6 @@ CONFIG: Dict[str, Any] = {
     "MIN_SEND_GAP_SECONDS": 1800,  # 30 минут между отправками
     "MIN_QUOTE_VOLUME": 40_000_000,  # 40M USDT
     "RISK_REWARD": 1.7,
-    "LEVERAGE": 15,  # стандартное плечо для сигналов
-
     "MIN_ATR_PCT": 0.45,  # Убираем микроскальпы
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.30,  # Стоп не слишком близко
@@ -72,6 +65,19 @@ CONFIG: Dict[str, Any] = {
     "RSI_LONG_MAX": 60.0,             # long запрещён если RSI > 60 (перекуплено)
     "STOCH_SHORT_MIN": 70.0,          # short только если StochRSI >= 70 (от перекупленности)
     "STOCH_LONG_MAX": 30.0,           # long только если StochRSI <= 30 (от перепроданности)
+    # === Order Book / Whale filters (optional quality layer) ===
+    "ORDERBOOK_FILTER_ENABLED": true,   # True чтобы включить подтверждение стаканом
+    "ORDERBOOK_DEPTH": 100,              # глубина стакана Binance (макс 1000, разумно 100–200)
+    "ORDERBOOK_IMBALANCE_MIN": 1.6,      # min (bid_sum/ask_sum) для long, (ask_sum/bid_sum) для short
+    "ORDERBOOK_WALL_MULT": 3.0,          # “стена”: объём уровня >= WALL_MULT * средний объём уровня
+    "ORDERBOOK_WALL_LEVELS": 3,          # сколько уровней около цены проверять на “стены”
+    "ORDERBOOK_SOFT_MODE": True,         # если стакан/трейды не доступны — не блокировать сигнал
+
+    "WHALE_TRADES_FILTER_ENABLED": False, # True чтобы включить фильтр по крупным сделкам
+    "WHALE_MIN_TRADE_USDT": 200_000,      # порог “китовой” сделки (в USDT)
+    "WHALE_LOOKBACK_SECONDS": 120,        # окно анализа последних сделок (сек)
+    "WHALE_NETFLOW_MIN_USDT": 150_000,    # min нетто-поток в сторону сигнала
+
 }
 
 
@@ -554,66 +560,155 @@ def fetch_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     raise RuntimeError(f"Не удалось получить данные с Binance: {path}")
 
 
-def _get_tick_size(symbol: str) -> float:
-    """Получить tickSize из кэша, при необходимости обновить exchangeInfo."""
-    ts = SYMBOL_TICK_SIZE.get(symbol)
-    if ts and ts > 0:
-        return ts
-    # fallback: обновим кэш один раз
+def fetch_order_book(symbol: str, limit: int = 100) -> Optional[Dict[str, Any]]:
+    """Получить стакан Binance Futures. limit: 5/10/20/50/100/500/1000."""
+    limit = int(limit)
+    if limit not in (5, 10, 20, 50, 100, 500, 1000):
+        limit = 100
     try:
-        data = fetch_binance("/fapi/v1/exchangeInfo")
-        for s in data.get("symbols", []):
-            sym = s.get("symbol")
-            if not sym:
+        return fetch_binance("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+    except Exception as e:
+        logging.error("Ошибка стакана %s: %s", symbol, e)
+        return None
+
+
+def fetch_recent_trades(symbol: str, limit: int = 200) -> Optional[List[Dict[str, Any]]]:
+    """Последние сделки (агрегированные) по Binance Futures."""
+    limit = max(1, min(int(limit), 1000))
+    try:
+        data = fetch_binance("/fapi/v1/aggTrades", {"symbol": symbol, "limit": limit})
+        # data: list of dicts
+        return data if isinstance(data, list) else None
+    except Exception as e:
+        logging.error("Ошибка сделок %s: %s", symbol, e)
+        return None
+
+
+def _sum_levels(levels: List[List[str]]) -> float:
+    """Сумма qty по уровням из depth API."""
+    s = 0.0
+    for px, qty in levels:
+        try:
+            s += float(qty)
+        except Exception:
+            continue
+    return s
+
+
+def _detect_wall(levels: List[List[str]], n_levels: int = 3, wall_mult: float = 3.0) -> bool:
+    """Простая детекция “стены” в первых n_levels около цены."""
+    if not levels:
+        return False
+    n = max(1, min(int(n_levels), len(levels)))
+    qtys = []
+    for i in range(n):
+        try:
+            qtys.append(float(levels[i][1]))
+        except Exception:
+            qtys.append(0.0)
+    if not qtys:
+        return False
+    avg = sum(qtys) / len(qtys) if qtys else 0.0
+    if avg <= 0:
+        return False
+    return any(q >= avg * float(wall_mult) for q in qtys)
+
+
+def orderbook_confirms(symbol: str, side: str, mid_price: float) -> Optional[Dict[str, Any]]:
+    """Подтверждение стаканом:
+    - имбаланс объёмов bid/ask
+    - наличие “стены” на стороне поддержки/сопротивления
+    Возвращает dict с метриками или None если данных нет/ошибка.
+    """
+    ob = fetch_order_book(symbol, limit=int(CONFIG.get("ORDERBOOK_DEPTH", 100)))
+    if not ob:
+        return None
+    bids = ob.get("bids", [])
+    asks = ob.get("asks", [])
+    if not bids or not asks:
+        return None
+
+    bid_sum = _sum_levels(bids)
+    ask_sum = _sum_levels(asks)
+
+    # защитимся от деления на ноль
+    if bid_sum <= 0 or ask_sum <= 0:
+        return None
+
+    imbalance = bid_sum / ask_sum
+
+    wall_levels = int(CONFIG.get("ORDERBOOK_WALL_LEVELS", 3))
+    wall_mult = float(CONFIG.get("ORDERBOOK_WALL_MULT", 3.0))
+    bid_wall = _detect_wall(bids, n_levels=wall_levels, wall_mult=wall_mult)
+    ask_wall = _detect_wall(asks, n_levels=wall_levels, wall_mult=wall_mult)
+
+    return {
+        "bid_sum": bid_sum,
+        "ask_sum": ask_sum,
+        "imbalance": imbalance,
+        "bid_wall": bid_wall,
+        "ask_wall": ask_wall,
+        "best_bid": float(bids[0][0]),
+        "best_ask": float(asks[0][0]),
+    }
+
+
+def whale_trades_confirms(symbol: str, side: str) -> Optional[Dict[str, Any]]:
+    """Фильтр по крупным сделкам (aggTrades):
+    Считаем нетто-поток (buy - sell) за WHALE_LOOKBACK_SECONDS и ищем крупные сделки.
+    Возвращает dict или None если данных нет/ошибка.
+    """
+    lookback = int(CONFIG.get("WHALE_LOOKBACK_SECONDS", 120))
+    min_trade_usdt = float(CONFIG.get("WHALE_MIN_TRADE_USDT", 200_000))
+    net_min = float(CONFIG.get("WHALE_NETFLOW_MIN_USDT", 150_000))
+
+    trades = fetch_recent_trades(symbol, limit=500)
+    if not trades:
+        return None
+
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - lookback * 1000
+
+    buy_usdt = 0.0
+    sell_usdt = 0.0
+    whales = 0
+
+    for tr in trades:
+        try:
+            ts = int(tr.get("T", 0))
+            if ts < cutoff:
                 continue
-            try:
-                for f in s.get("filters", []):
-                    if f.get("filterType") == "PRICE_FILTER":
-                        SYMBOL_TICK_SIZE[sym] = float(f.get("tickSize", 0.0))
-                    elif f.get("filterType") == "LOT_SIZE":
-                        SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
-            except Exception:
-                continue
-        ts = SYMBOL_TICK_SIZE.get(symbol)
-        return ts if ts and ts > 0 else 0.0
-    except Exception:
-        return 0.0
+            price = float(tr.get("p"))
+            qty = float(tr.get("q"))
+            usdt = price * qty
+            is_maker = bool(tr.get("m", False))  # maker side, in aggTrades
+            # В Binance aggTrades 'm' True = buyer is the maker (обычно sell-инициатива),
+            # поэтому условно: m True => sell pressure, m False => buy pressure.
+            if is_maker:
+                sell_usdt += usdt
+            else:
+                buy_usdt += usdt
+            if usdt >= min_trade_usdt:
+                whales += 1
+        except Exception:
+            continue
 
+    net = buy_usdt - sell_usdt
 
-def round_price_to_tick(symbol: str, price: float) -> float:
-    """Округляет цену к шагу цены (tickSize) Binance Futures."""
-    tick = _get_tick_size(symbol)
-    if not tick or tick <= 0:
-        # безопасный fallback: 1e-6
-        return round(price, 6)
-    # округление вниз к тик-спейсу (чтобы лимит/стоп не ушли за шаг)
-    steps = math.floor(price / tick)
-    rounded = steps * tick
-    # устранение плавающей ошибки
-    prec = max(0, int(round(-math.log10(tick), 0))) if tick < 1 else 0
-    return float(f"{rounded:.{prec}f}")
+    # подтверждение в сторону сделки
+    confirms = False
+    if side == "long" and net >= net_min:
+        confirms = True
+    if side == "short" and net <= -net_min:
+        confirms = True
 
-
-def _fix_prices_for_side(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float) -> Tuple[float, float, float]:
-    """Гарантирует корректный порядок цен после округлений."""
-    entry_r = round_price_to_tick(symbol, entry)
-    sl_r = round_price_to_tick(symbol, stop_loss)
-    tp_r = round_price_to_tick(symbol, take_profit)
-
-    if side == "long":
-        # должно быть: SL < ENTRY < TP
-        if sl_r >= entry_r:
-            sl_r = round_price_to_tick(symbol, entry_r * (1.0 - 0.001))  # -0.1% fallback
-        if tp_r <= entry_r:
-            tp_r = round_price_to_tick(symbol, entry_r * (1.0 + 0.0017))  # +0.17% fallback
-    else:
-        # short: TP < ENTRY < SL
-        if sl_r <= entry_r:
-            sl_r = round_price_to_tick(symbol, entry_r * (1.0 + 0.001))  # +0.1% fallback
-        if tp_r >= entry_r:
-            tp_r = round_price_to_tick(symbol, entry_r * (1.0 - 0.0017))  # -0.17% fallback
-
-    return entry_r, sl_r, tp_r
+    return {
+        "buy_usdt": buy_usdt,
+        "sell_usdt": sell_usdt,
+        "net_usdt": net,
+        "whales": whales,
+        "confirms": confirms,
+    }
 
 
 def get_usdt_perp_symbols() -> List[str]:
@@ -621,17 +716,7 @@ def get_usdt_perp_symbols() -> List[str]:
     symbols = []
     for s in data.get("symbols", []):
         if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT":
-            sym = s["symbol"]
-            symbols.append(sym)
-            # Сохраняем параметры цены/кол-ва для корректного округления
-            try:
-                for f in s.get("filters", []):
-                    if f.get("filterType") == "PRICE_FILTER":
-                        SYMBOL_TICK_SIZE[sym] = float(f.get("tickSize", 0.0))
-                    elif f.get("filterType") == "LOT_SIZE":
-                        SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
-            except Exception:
-                pass
+            symbols.append(s["symbol"])
     logging.info("Найдено %d USDT-M PERPETUAL символов", len(symbols))
     return symbols
 
@@ -1067,6 +1152,52 @@ def analyse_symbol(
                 return None
         # Если тело < neutral_threshold - пропускаем (нейтральная свеча OK)
 
+    # 4.5 ✅ Доп. подтверждение стаканом и/или “китовыми” сделками (опционально)
+    # Зачем: уменьшить количество “шумных” сигналов, где нет поддержки объёмом.
+    if CONFIG.get("ORDERBOOK_FILTER_ENABLED", False):
+        obm = orderbook_confirms(symbol, side, close)
+        if obm is None:
+            if not CONFIG.get("ORDERBOOK_SOFT_MODE", True):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: нет данных стакана (soft_mode=OFF)", symbol)
+                return None
+        else:
+            imb_min = float(CONFIG.get("ORDERBOOK_IMBALANCE_MIN", 1.6))
+            # long: bids должны доминировать; short: asks должны доминировать
+            if side == "long":
+                ok_imb = (obm["imbalance"] >= imb_min)
+                ok_wall = bool(obm.get("bid_wall", False)) and not bool(obm.get("ask_wall", False))
+                if not (ok_imb or ok_wall):
+                    if CONFIG.get("DEBUG_REASONS"):
+                        logging.info("%s отклонён: стакан не подтверждает long. imbalance=%.2f bid_wall=%s ask_wall=%s",
+                                     symbol, obm["imbalance"], obm["bid_wall"], obm["ask_wall"])
+                    return None
+            else:
+                # для short смотрим обратный имбаланс
+                inv = (obm["ask_sum"] / obm["bid_sum"]) if obm["bid_sum"] > 0 else 0.0
+                ok_imb = (inv >= imb_min)
+                ok_wall = bool(obm.get("ask_wall", False)) and not bool(obm.get("bid_wall", False))
+                if not (ok_imb or ok_wall):
+                    if CONFIG.get("DEBUG_REASONS"):
+                        logging.info("%s отклонён: стакан не подтверждает short. inv_imb=%.2f bid_wall=%s ask_wall=%s",
+                                     symbol, inv, obm["bid_wall"], obm["ask_wall"])
+                    return None
+
+    if CONFIG.get("WHALE_TRADES_FILTER_ENABLED", False):
+        wm = whale_trades_confirms(symbol, side)
+        if wm is None:
+            if not CONFIG.get("ORDERBOOK_SOFT_MODE", True):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: нет данных сделок (soft_mode=OFF)", symbol)
+                return None
+        else:
+            if not bool(wm.get("confirms", False)):
+                if CONFIG.get("DEBUG_REASONS"):
+                    logging.info("%s отклонён: китовые сделки не подтверждают. net=%.0f buy=%.0f sell=%.0f whales=%d",
+                                 symbol, wm.get("net_usdt", 0.0), wm.get("buy_usdt", 0.0), wm.get("sell_usdt", 0.0), int(wm.get("whales", 0)))
+                return None
+
+
     # 5. BTC-фильтр (МЯГКИЙ - только жёсткие условия)
     if CONFIG["BTC_FILTER_ENABLED"]:
         btc_price = btc_ctx["price"]
@@ -1142,7 +1273,9 @@ def analyse_symbol(
         
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((close - take_profit) / close) * 100.0
-    leverage = int(CONFIG.get("LEVERAGE", 15))
+
+    leverage = 20
+
     # ✅ QUALITY: Фильтр минимального тейка (главный против скальпов)
     if tp_pct < CONFIG["MIN_TP_PCT"]:
         if CONFIG.get("DEBUG_REASONS"):
@@ -1162,16 +1295,13 @@ def analyse_symbol(
     distance_from_ema_pct = abs((close - ema) / ema) * 100.0
     score = (atr_pct * 10.0) + (abs(macd_val) * 2.0) + (distance_from_ema_pct * 100.0)
 
-    # ✅ Округляем entry/SL/TP к tickSize Binance и страхуем порядок цен
-    entry_r, stop_r, tp_r = _fix_prices_for_side(symbol, side, close, stop_loss, take_profit)
-
     return {
         "symbol": symbol,
         "side": side,
         "leverage": leverage,
-        "entry": entry_r,
-        "take_profit": tp_r,
-        "stop_loss": stop_r,
+        "entry": close,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
         "ema200": ema,
         "rsi": rsi,
         "impulse_time": impulse_time,
