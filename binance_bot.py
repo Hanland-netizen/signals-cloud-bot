@@ -66,7 +66,7 @@ CONFIG: Dict[str, Any] = {
     "STOCH_SHORT_MIN": 70.0,          # short только если StochRSI >= 70 (от перекупленности)
     "STOCH_LONG_MAX": 30.0,           # long только если StochRSI <= 30 (от перепроданности)
     # === Order Book / Whale filters (optional quality layer) ===
-    "ORDERBOOK_FILTER_ENABLED": true,   # True чтобы включить подтверждение стаканом
+    "ORDERBOOK_FILTER_ENABLED": True,   # True чтобы включить подтверждение стаканом
     "ORDERBOOK_DEPTH": 100,              # глубина стакана Binance (макс 1000, разумно 100–200)
     "ORDERBOOK_IMBALANCE_MIN": 1.6,      # min (bid_sum/ask_sum) для long, (ask_sum/bid_sum) для short
     "ORDERBOOK_WALL_MULT": 3.0,          # “стена”: объём уровня >= WALL_MULT * средний объём уровня
