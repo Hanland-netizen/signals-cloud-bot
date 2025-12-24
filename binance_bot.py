@@ -1106,6 +1106,10 @@ def analyse_symbol(
 
     if side == "long":
         stop_loss = swing_low * (1.0 - buf_long)
+        # ✅ НОВОЕ: стоп не должен быть слишком близко к входу относительно ATR
+        min_stop_abs = atr_abs * float(CONFIG.get("MIN_STOP_ATR_MULT", 0.60))
+        if (close - stop_loss) < min_stop_abs:
+            stop_loss = close - min_stop_abs
         # Защита: стоп не может быть выше или равен входу
         if stop_loss >= close:
             if CONFIG.get("DEBUG_REASONS"):
@@ -1125,6 +1129,10 @@ def analyse_symbol(
         tp_pct = abs((take_profit - close) / close) * 100.0
     else:  # short
         stop_loss = swing_high * (1.0 + buf_short)
+        # ✅ НОВОЕ: стоп не должен быть слишком близко к входу относительно ATR
+        min_stop_abs = atr_abs * float(CONFIG.get("MIN_STOP_ATR_MULT", 0.60))
+        if (stop_loss - close) < min_stop_abs:
+            stop_loss = close + min_stop_abs
         # Защита: стоп не может быть ниже или равен входу
         if stop_loss <= close:
             if CONFIG.get("DEBUG_REASONS"):
