@@ -148,9 +148,21 @@ LAST_SEND_TS: float = 0.0
 
 
 def normalize_command(text: str) -> str:
-    """Нормализует команду, убирая эмодзи и лишние пробелы."""
-    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text)
-    return text.strip()
+    """Normalises button text into a stable command key (EN/RU-safe).
+
+    - Strips leading emoji.
+    - If the label is bilingual like 'Status / Статус', keeps the left side ('Status').
+      (This keeps the existing logic unchanged, because handlers match the English keys.)
+    """
+    if not text:
+        return ""
+    # Strip leading emoji blocks + whitespace
+    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text).strip()
+    # If bilingual label, keep the left part (English) to preserve existing comparisons
+    if "/" in text:
+        text = text.split("/", 1)[0].strip()
+    return text
+
 
 
 def enqueue_signal(signal_data: Dict[str, Any]) -> None:
