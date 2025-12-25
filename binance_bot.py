@@ -89,7 +89,7 @@ class SignalState:
     def reset_if_new_day(self) -> None:
         today = date.today()
         if today != self.last_reset_date:
-            logging.info("Новый день, обнуляем счётчики сигналов.")
+            logging.info("New day — counters reset. / Новый день — счётчики обнулены.")
             self.signals_sent_today = 0
             self.last_reset_date = today
             self.sent_signals_cache.clear()
@@ -98,7 +98,7 @@ class SignalState:
         """Сбрасываем часовой счётчик при смене часа"""
         current_hour = datetime.now().hour
         if current_hour != self.last_hour_reset:
-            logging.info("Новый час, обнуляем часовой счётчик. Было: %d", self.signals_sent_this_hour)
+            logging.info("New hour — hourly counter reset. Was: %d / Новый час — обнулён часовой счётчик. Было: %d", self.signals_sent_this_hour)
             self.signals_sent_this_hour = 0
             self.last_hour_reset = current_hour
 
@@ -157,7 +157,7 @@ def enqueue_signal(signal_data: Dict[str, Any]) -> None:
     """✅ НОВАЯ ФУНКЦИЯ: Добавляет сигнал в очередь отправки"""
     global SEND_QUEUE
     SEND_QUEUE.append(signal_data)
-    logging.info("Сигнал добавлен в очередь: %s %s (в очереди: %d)",
+    logging.info("Signal queued: %s %s (queue: %d) / Сигнал добавлен в очередь: %s %s (в очереди: %d)",
                  signal_data["symbol"], signal_data["side"], len(SEND_QUEUE))
 
 
@@ -176,7 +176,7 @@ def try_send_from_queue() -> None:
     
     # 2. Проверяем глобальные лимиты (день/час)
     if not STATE.can_send_global():
-        logging.info("Достигнут глобальный лимит (день: %d/%d, час: %d/%d). Очередь: %d",
+        logging.info("Global limit reached (day: %d/%d, hour: %d/%d). Queue: %d / Достигнут глобальный лимит (день: %d/%d, час: %d/%d). Очередь: %d",
                      STATE.signals_sent_today, CONFIG["MAX_SIGNALS_PER_DAY"],
                      STATE.signals_sent_this_hour, CONFIG["MAX_SIGNALS_PER_HOUR"],
                      len(SEND_QUEUE))
@@ -196,14 +196,14 @@ def try_send_from_queue() -> None:
     if not STATE.can_send_symbol(symbol):
         # ✅ ИСПРАВЛЕНО: Возвращаем в КОНЕЦ очереди, чтобы не блокировать
         SEND_QUEUE.append(signal_data)
-        logging.info("Символ %s ещё в cooldown, возвращён в конец очереди (в очереди: %d)",
+        logging.info("Symbol %s still in cooldown — moved to queue tail (queue: %d) / Символ %s ещё в cooldown — возвращён в конец очереди (в очереди: %d)",
                      symbol, len(SEND_QUEUE))
         return
     
     # 6. Отправляем сигнал
     active_subs = db_get_active_subscribers()
     if not active_subs:
-        logging.info("Нет активных подписчиков, сигнал пропущен")
+        logging.info("No active subscribers — signal skipped. / Нет активных подписчиков — сигнал пропущен.")
         return
     
     text = build_signal_text(
@@ -235,9 +235,9 @@ def try_send_from_queue() -> None:
     try:
         db_log_signal(signal_data, sent_to=len(active_subs))
     except Exception as e:
-        logging.error("Не удалось записать сигнал в БД: %s", e)
+        logging.error("Failed to write signal to DB: %s / Не удалось записать сигнал в БД: %s", e)
     
-    logging.info("✅ Сигнал отправлен: %s %s (score: %.2f, осталось в очереди: %d)",
+    logging.info("✅ Signal sent: %s %s (score: %.2f, queue left: %d) / ✅ Сигнал отправлен: %s %s (score: %.2f, осталось в очереди: %d)",
                  symbol, signal_data["side"], signal_data.get("score", 0), len(SEND_QUEUE))
 
 
@@ -294,7 +294,7 @@ def db_ensure_tables() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_log_symbol ON signals_log(symbol);")
 
     DB_CONN.commit()
-    logging.info("Таблицы subscribers/signals_log проверены/созданы.")
+    logging.info("Tables subscribers/signals_log checked/created. / Таблицы subscribers/signals_log проверены/созданы.")
 
 
 def db_add_or_update_subscriber(chat_id: str, is_admin: bool) -> None:
@@ -315,7 +315,7 @@ def db_add_or_update_subscriber(chat_id: str, is_admin: bool) -> None:
             (int(chat_id), is_admin),
         )
     logging.info(
-        "Добавлен подписчик в БД: %s (admin=%s)", chat_id, "True" if is_admin else "False"
+        "Subscriber upserted: %s (admin=%s) / Добавлен/обновлён подписчик: %s (admin=%s)", chat_id, "True" if is_admin else "False"
     )
 
 
@@ -332,7 +332,7 @@ def db_unsubscribe(chat_id: str) -> None:
             """,
             (int(chat_id),),
         )
-    logging.info("Подписчик %s помечен как неактивный.", chat_id)
+    logging.info("Subscriber %s marked inactive. / Подписчик %s помечен как неактивный.", chat_id)
 
 
 def db_get_active_subscribers() -> List[int]:
@@ -457,7 +457,7 @@ def admin_stats_text(days: int = 7) -> str:
         f"{top_text}\n\n"
         "<b>Последний сигнал:</b>\n"
         f"{last_line}\n\n"
-        f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}"
+        f"🕒 Updated: {datetime.now().strftime('%H:%M:%S')}"
     )
 
 
@@ -483,7 +483,7 @@ def send_telegram_request(method: str, data: Dict[str, Any]) -> Optional[Dict[st
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        logging.error("Ошибка запроса к Telegram (%s): %s", method, e)
+        logging.error("Telegram request error (%s): %s / Ошибка запроса к Telegram (%s): %s", method, e)
         return None
 
 
@@ -509,23 +509,23 @@ def send_telegram_message(
         payload["reply_markup"] = reply_markup
     res = send_telegram_request("sendMessage", payload)
     if res and res.get("ok"):
-        logging.info("Message sent to Telegram")
+        logging.info("Message sent to Telegram. / Сообщение отправлено в Telegram.")
     else:
-        logging.error("Failed to send Telegram message: %s", res)
+        logging.error("Failed to send Telegram message: %s / Не удалось отправить сообщение в Telegram: %s", res)
 
 
 def get_reply_keyboard(chat_id: str) -> Dict[str, Any]:
     is_admin = (str(chat_id) == TG_ADMIN_ID) if TG_ADMIN_ID else False
 
     rows = [
-        [{"text": "🚀 Start"}, {"text": "📊 Status"}],
-        [{"text": "ℹ️ Help"}, {"text": "🔴 Stop"}],
-        [{"text": "🆔 My ID"}],
+        [{"text": "🚀 Start / Старт"}, {"text": "📊 Status / Статус"}],
+        [{"text": "ℹ️ Help / Помощь"}, {"text": "🔴 Stop / Стоп"}],
+        [{"text": "🆔 My ID / Мой ID"}],
     ]
     if is_admin:
-        rows.append([{"text": "🛠 Admin"}, {"text": "⚙️ Settings"}])
+        rows.append([{"text": "🛠 Admin / Админ"}, {"text": "⚙️ Settings / Настройки"}])
         rows.append([{"text": "🛑 Risk OFF"}, {"text": "✅ Risk ON"}])
-        rows.append([{"text": "🧪 Test scan"}, {"text": "📈 Stats"}])
+        rows.append([{"text": "🧪 Test scan / Тест-скан"}, {"text": "📈 Stats / Статистика"}])
 
     return {
         "keyboard": rows,
@@ -793,7 +793,7 @@ def get_btc_context() -> Dict[str, Any]:
         "change_pct": change_pct,
     }
     logging.info(
-        "BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
+        "BTC context: price=%.2f, EMA200=%.2f, RSI=%.1f, 24h change=%.2f%% / BTC контекст: цена=%.2f, EMA200=%.2f, RSI=%.1f, 24h изменение=%.2f%%",
         price,
         ema200_val,
         rsi_val,
@@ -1196,17 +1196,17 @@ def analyse_symbol(
 def scan_market_and_send_signals() -> int:
     """✅ ФИНАЛЬНАЯ ВЕРСИЯ: Только 1 лучший сигнал из скана"""
     if STATE.is_risk_off():
-        logging.info("Режим Risk OFF, сканирование пропускается.")
+        logging.info("Risk OFF mode — scan skipped. / Режим Risk OFF, сканирование пропускается.")
         return 0
     now_utc = datetime.now(timezone.utc)
     if in_fomc_window(now_utc):
-        logging.info("Сейчас окно FOMC, сканирование отключено.")
+        logging.info("FOMC window — scanning disabled. / Сейчас окно FOMC, сканирование отключено.")
         return 0
     
     btc_ctx = get_btc_context()
     symbols = get_usdt_perp_symbols()
     symbols = get_24h_volume_filter(symbols)
-    logging.info("Analysing %d символов...", len(symbols))
+    logging.info("Analysing %d symbols... / Анализ %d символов...", len(symbols))
 
     # 1. Собираем ВСЕ кандидатов
     candidates: List[Dict[str, Any]] = []
@@ -1215,14 +1215,14 @@ def scan_market_and_send_signals() -> int:
         try:
             idea = analyse_symbol(symbol, btc_ctx)
         except Exception as e:
-            logging.error("Ошибка анализа %s: %s", symbol, e)
+            logging.error("Analysis error %s: %s / Ошибка анализа %s: %s", symbol, e)
             continue
             
         if idea:
             candidates.append(idea)
     
     if not candidates:
-        logging.info("Сканирование завершено. Кандидатов не найдено.")
+        logging.info("Scan finished. No candidates. / Сканирование завершено. Кандидатов не найдено.")
         return 0
     
     # 2. Сортируем по score (лучшие сверху)
@@ -1242,7 +1242,7 @@ def scan_market_and_send_signals() -> int:
     # 4. Проверяем антидубликат ПЕРЕД добавлением в очередь
     signal_key = best_candidate.get("signal_key")
     if signal_key and signal_key in STATE.sent_signals_cache:
-        logging.info("Лучший сигнал %s уже был отправлен (дубликат), пропускаем", best_candidate["symbol"])
+        logging.info("Best signal %s was already sent (duplicate) — skipping. / Лучший сигнал %s уже был отправлен (дубликат), пропускаем", best_candidate["symbol"])
         return 0
     
     # 5. Добавляем в очередь
@@ -1283,7 +1283,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     if first_token in ("/start",) or lower in ("start", "🚀 start", "старт", "🚀 старт"):
         db_add_or_update_subscriber(chat_id, is_admin=is_admin)
         send_telegram_message(
-            "✅ Подписка включена. Буду присылать сигналы, когда появятся условия.",
+            "✅ Subscription enabled. I will send signals when conditions appear. / ✅ Подписка включена. Буду присылать сигналы, когда появятся условия.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
@@ -1314,7 +1314,7 @@ def handle_command(update: Dict[str, Any]) -> None:
 
     if first_token in ("/id",) or lower in ("my id", "🆔 my id", "id", "мой id", "🆔 мой id"):
         send_telegram_message(
-            f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
+            f"🆔 Your Telegram ID: <code>{user_id}</code> / 🆔 Ваш Telegram ID: <code>{user_id}</code>",
             chat_id=chat_id,
             html=True,
             reply_markup=kb,
@@ -1331,13 +1331,13 @@ def handle_command(update: Dict[str, Any]) -> None:
             f"📈 Multi‑TF analysis: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
             f"💹 BTC filter: {'enabled' if CONFIG['BTC_FILTER_ENABLED'] else 'disabled'}",
             f"🔥 ATR filter: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
-            f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
+            f"💰 Min 24h volume: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             f"🛑 Risk OFF: {risk_off_state}",
         ]
         if is_admin:
-            msg_lines.append(f"👥 Подписчиков: {db_get_subscribers_count()}")
+            msg_lines.append(f"👥 Subscribers: {db_get_subscribers_count()}")
         msg_lines.append("")
-        msg_lines.append(f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}")
+        msg_lines.append(f"🕒 Updated: {datetime.now().strftime('%H:%M:%S')}")
         send_telegram_message("\n".join(msg_lines), chat_id=chat_id, html=True, reply_markup=kb)
         return
 
@@ -1353,13 +1353,13 @@ def handle_command(update: Dict[str, Any]) -> None:
 
     if first_token in ("/admin",) or lower in ("admin", "🛠 admin", "админ", "🛠 админ"):
         msg_admin = (
-            "<b>🛠 Admin-панель</b>\n\n"
-            f"👥 Подписчиков: {db_get_subscribers_count()}\n"
-            f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
+            "<b>🛠 Admin panel / Админ‑панель</b>\n\n"
+            f"👥 Subscribers: {db_get_subscribers_count()}\n"
+            f"📌 Signals today: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
             f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
-            f"💹 BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}\n"
+            f"💹 BTC filter: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}\n"
             f"🔥 ATR min/max: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%\n\n"
-            "Используйте кнопки админа ниже 👇"
+            "Use the admin buttons below 👇 / Используйте кнопки админа ниже 👇"
         )
         send_telegram_message(msg_admin, chat_id=chat_id, html=True, reply_markup=kb)
         return
@@ -1411,7 +1411,7 @@ def telegram_polling_loop() -> None:
         logging.error("TELEGRAM_BOT_TOKEN is not set. Exiting.")
         return
     last_update_id = None
-    logging.info("Starting Telegram bot polling...")
+    logging.info("Starting Telegram bot polling... / Запуск Telegram bot polling...")
     while True:
         params: Dict[str, Any] = {"timeout": 25}
         if last_update_id is not None:
@@ -1422,7 +1422,7 @@ def telegram_polling_loop() -> None:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logging.error("Error fetching updates: %s", e)
+            logging.error("Error fetching updates: %s / Ошибка получения обновлений: %s", e)
             time.sleep(5)
             continue
         if not data.get("ok"):
@@ -1438,7 +1438,7 @@ def telegram_polling_loop() -> None:
 
             # Route both slash-commands and button labels to the command handler
             known = {
-                "start", "help", "stop", "status", "admin", "stats", "my id", "settings",
+                "start", "help", "stop", "status", "admin", "stats", "my id", "settings", "start / старт", "status / статус", "help / помощь", "stop / стоп", "my id / мой id", "admin / админ", "stats / статистика", "settings / настройки",
                 "risk on", "risk off", "test scan", "test-scan", "testscan",
                 # RU compatibility (old buttons / users)
                 "старт", "помощь", "стоп", "статус", "админ", "статистика", "мой id", "настройки",
@@ -1483,7 +1483,7 @@ def main_loop() -> None:
     last_scan_ts = 0.0
 
     def handle_sigterm(signum, frame):
-        logging.info("Stop signal received. Shutting down...")
+        logging.info("Stop signal received. Shutting down... / Получен сигнал остановки. Завершение работы...")
         raise SystemExit
 
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -1502,11 +1502,11 @@ def main_loop() -> None:
         
         # Сканируем рынок по расписанию
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
-            logging.info("Market scan started...")
+            logging.info("Market scan started... / Начало сканирования рынка...")
             try:
                 scan_market_and_send_signals()
             except Exception as e:
-                logging.error("Market scan error: %s", e)
+                logging.error("Market scan error: %s / Ошибка при сканировании рынка: %s", e)
             last_scan_ts = time.time()
         
         time.sleep(1)
@@ -1516,6 +1516,6 @@ if __name__ == "__main__":
     try:
         main_loop()
     except SystemExit:
-        logging.info("Bot stopped.")
+        logging.info("Bot stopped. / Бот остановлен.")
     except Exception as e:
         logging.error("Critical error: %s", e)
