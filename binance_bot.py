@@ -544,7 +544,7 @@ def fetch_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         except Exception as e:
             delay = 2 ** attempt
             logging.error(
-                "Ошибка запроса к %s (попытка %d/5): %s. Ждём %d сек перед повтором...",
+                "Ошибка запроса к %s (попытка %d/5): %s. Ждём %d sec перед повтором...",
                 path,
                 attempt + 1,
                 e,
@@ -1293,7 +1293,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     if first_token in ("/stop",) or lower in ("stop", "🔴 stop", "стоп", "🔴 стоп"):
         db_unsubscribe(chat_id)
         send_telegram_message(
-            "🔴 Подписка выключена. Если передумаете — нажмите 🚀 Start.",
+            "🛑 Subscription stopped. If you change your mind, press 🚀 Start.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
@@ -1303,10 +1303,11 @@ def handle_command(update: Dict[str, Any]) -> None:
     if first_token in ("/help",) or lower in ("help", "ℹ️ help", "помощь", "ℹ️ помощь"):
         help_text = (
             "<b>ℹ️ Help</b>\n\n"
-            "• 🚀 <b>Старт</b> — подписаться на сигналы\n"
-            "• 🔴 <b>Stop loss</b> — отписаться\n"
-            "• 📊 <b>Статус</b> — параметры/режимы бота\n\n"
-            "Если вы админ — появятся дополнительные кнопки."
+            "• 🚀 <b>Start</b> — subscribe to signals\n"
+            "• 🛑 <b>Stop</b> — unsubscribe\n"
+            "• 📊 <b>Status</b> — bot parameters & modes\n"
+            "• 📈 <b>Stats</b> — basic stats\n\n"
+            "If you are an admin, extra buttons will be shown."
         )
         send_telegram_message(help_text, chat_id=chat_id, html=True, reply_markup=kb)
         return
@@ -1321,15 +1322,15 @@ def handle_command(update: Dict[str, Any]) -> None:
         return
 
     if first_token in ("/status",) or lower in ("status", "📊 status", "статус", "📊 статус"):
-        risk_off_state = "активен" if (STATE and STATE.is_risk_off()) else "выключен"
+        risk_off_state = "active" if (STATE and STATE.is_risk_off()) else "disabled"
         msg_lines = [
-            "<b>📊 Status торгового бота</b>",
+            "<b>📊 Bot status</b>",
             "",
-            f"⏱ Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек",
-            f"🎯 Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
-            f"📈 Multi-TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
-            f"💹 Фильтр BTC: {'включён' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}",
-            f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
+            f"⏱ Scan interval: {CONFIG['SCAN_INTERVAL_SECONDS']} sec",
+            f"🎯 Daily signal limit: {CONFIG['MAX_SIGNALS_PER_DAY']}",
+            f"📈 Multi‑TF analysis: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
+            f"💹 BTC filter: {'enabled' if CONFIG['BTC_FILTER_ENABLED'] else 'disabled'}",
+            f"🔥 ATR filter: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
             f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             f"🛑 Risk OFF: {risk_off_state}",
         ]
@@ -1343,7 +1344,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     # ===== Админские команды =====
     if not is_admin:
         send_telegram_message(
-            "Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
+            "I don't recognise that command yet.\nИспользуйте кнопки под полем ввода или /help.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
@@ -1398,7 +1399,7 @@ def handle_command(update: Dict[str, Any]) -> None:
         return
 
     send_telegram_message(
-        "Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
+        "I don't recognise that command yet.\nИспользуйте кнопки под полем ввода или /help.",
         chat_id=chat_id,
         html=False,
         reply_markup=kb,
@@ -1407,10 +1408,10 @@ def handle_command(update: Dict[str, Any]) -> None:
 
 def telegram_polling_loop() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN не задан. Завершение.")
+        logging.error("TELEGRAM_BOT_TOKEN is not set. Exiting.")
         return
     last_update_id = None
-    logging.info("Запуск Telegram bot polling...")
+    logging.info("Starting Telegram bot polling...")
     while True:
         params: Dict[str, Any] = {"timeout": 25}
         if last_update_id is not None:
@@ -1433,13 +1434,23 @@ def telegram_polling_loop() -> None:
             if not msg:
                 continue
             text = msg.get("text", "") or ""
-            if text.startswith("/") or any(kw in text.lower() for kw in ["старт", "стоп", "помощь", "статус", "админ", "настройки", "risk", "тест-скан", "статистика", "мой id"]):
+            norm = normalize_command(text).lower()
+
+            # Route both slash-commands and button labels to the command handler
+            known = {
+                "start", "help", "stop", "status", "admin", "stats", "my id", "settings",
+                "risk on", "risk off", "test scan", "test-scan", "testscan",
+                # RU compatibility (old buttons / users)
+                "старт", "помощь", "стоп", "статус", "админ", "статистика", "мой id", "настройки",
+            }
+
+            if text.startswith("/") or norm in known:
                 handle_command(upd)
             else:
                 chat_id = str(msg.get("chat", {}).get("id"))
                 send_telegram_message(
-                    "Я пока не понимаю эту команду.\n"
-                    "Пожалуйста, используйте кнопки под полем ввода или /help.",
+                    "I don't recognise that command yet.\n"
+                    "Please use the buttons below or type /help.",
                     chat_id=chat_id,
                     html=False,
                     reply_markup=get_reply_keyboard(chat_id),
@@ -1458,16 +1469,16 @@ def main_loop() -> None:
     logging.info("Конфигурация:")
     logging.info("  - Минимальный объём: %s USDT", f"{CONFIG['MIN_QUOTE_VOLUME']:,}")
     logging.info("  - Timeframe: %s + %s", CONFIG["TIMEFRAME"], CONFIG["HTF_TIMEFRAME"])
-    logging.info("  - Интервал сканирования: %d сек", CONFIG["SCAN_INTERVAL_SECONDS"])
+    logging.info("  - Интервал сканирования: %d sec", CONFIG["SCAN_INTERVAL_SECONDS"])
     logging.info("  - Лимит сигналов в день: %d", CONFIG["MAX_SIGNALS_PER_DAY"])
     logging.info("  - Лимит сигналов в час: %d", CONFIG["MAX_SIGNALS_PER_HOUR"])
     logging.info("  - Макс. сигналов за скан: %d", CONFIG["MAX_SIGNALS_PER_SCAN"])
-    logging.info("  - Мин. интервал между отправками: %d сек", CONFIG["MIN_SEND_GAP_SECONDS"])
+    logging.info("  - Мин. интервал между отправками: %d sec", CONFIG["MIN_SEND_GAP_SECONDS"])
     logging.info("  - Risk/Reward: %.2f", CONFIG["RISK_REWARD"])
     logging.info("  - Мин. стоп: %.3f%%", CONFIG["MIN_STOP_PCT"])
     logging.info("  - Мин. ATR: %.3f%%", CONFIG["MIN_ATR_PCT"])
     logging.info("  - BTC фильтр: %s", "ON" if CONFIG["BTC_FILTER_ENABLED"] else "OFF")
-    logging.info("  - Cooldown на символ: %d сек", CONFIG["SYMBOL_COOLDOWN_SECONDS"])
+    logging.info("  - Cooldown на символ: %d sec", CONFIG["SYMBOL_COOLDOWN_SECONDS"])
 
     last_scan_ts = 0.0
 
