@@ -47,7 +47,7 @@ CONFIG: Dict[str, Any] = {
 
     "MIN_ATR_PCT": 0.45,  # Убираем микроскальпы
     "MAX_ATR_PCT": 5.0,
-    "MIN_STOP_PCT": 0.30,  # Стоп не слишком близко
+    "MIN_STOP_PCT": 0.30,  # Stop loss не слишком близко
     "MAX_STOP_PCT": 1.20,
     "MIN_TP_PCT": 0.70,  # Минимальный тейк 0.7%
     "STOP_BUFFER_LONG": 0.20,
@@ -444,7 +444,7 @@ def admin_stats_text(days: int = 7) -> str:
         )
 
     return (
-        "<b>📈 Статистика сигналов</b>\n"
+        "<b>📈 Stats сигналов</b>\n"
         f"Период: последние {days} дней\n\n"
         f"Всего сигналов: <b>{int(total.get('c', 0))}</b>\n"
         f"За {days} дней: <b>{int(last_n.get('c', 0))}</b>\n"
@@ -509,23 +509,23 @@ def send_telegram_message(
         payload["reply_markup"] = reply_markup
     res = send_telegram_request("sendMessage", payload)
     if res and res.get("ok"):
-        logging.info("Сообщение отправлено в Telegram")
+        logging.info("Message sent to Telegram")
     else:
-        logging.error("Ошибка отправки в Telegram: %s", res)
+        logging.error("Failed to send Telegram message: %s", res)
 
 
 def get_reply_keyboard(chat_id: str) -> Dict[str, Any]:
     is_admin = (str(chat_id) == TG_ADMIN_ID) if TG_ADMIN_ID else False
 
     rows = [
-        [{"text": "🚀 Старт"}, {"text": "📊 Статус"}],
-        [{"text": "ℹ️ Помощь"}, {"text": "🔴 Стоп"}],
-        [{"text": "🆔 Мой ID"}],
+        [{"text": "🚀 Start"}, {"text": "📊 Status"}],
+        [{"text": "ℹ️ Help"}, {"text": "🔴 Stop"}],
+        [{"text": "🆔 My ID"}],
     ]
     if is_admin:
-        rows.append([{"text": "🛠 Админ"}, {"text": "⚙️ Настройки"}])
+        rows.append([{"text": "🛠 Admin"}, {"text": "⚙️ Settings"}])
         rows.append([{"text": "🛑 Risk OFF"}, {"text": "✅ Risk ON"}])
-        rows.append([{"text": "🧪 Тест-скан"}, {"text": "📈 Статистика"}])
+        rows.append([{"text": "🧪 Test scan"}, {"text": "📈 Stats"}])
 
     return {
         "keyboard": rows,
@@ -632,7 +632,7 @@ def get_usdt_perp_symbols() -> List[str]:
                         SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
             except Exception:
                 pass
-    logging.info("Найдено %d USDT-M PERPETUAL символов", len(symbols))
+    logging.info("Found %d USDT-M PERPETUAL символов", len(symbols))
     return symbols
 
 
@@ -650,7 +650,7 @@ def get_24h_volume_filter(symbols: List[str]) -> List[str]:
         s for s in symbols if vol_map.get(s, 0.0) >= CONFIG["MIN_QUOTE_VOLUME"]
     ]
     logging.info(
-        "После фильтрации по объёму (>= %s USDT): %d символов",
+        "After volume filter (>= %s USDT): %d символов",
         f"{CONFIG['MIN_QUOTE_VOLUME']:,}",
         len(filtered),
     )
@@ -831,19 +831,19 @@ def build_signal_text(
     impulse_str = impulse_time.isoformat()
     return (
         f"{arrow} <b>{symbol}</b> {side_str}\n"
-        f"Плечо {leverage}х\n"
-        f"Вход (ориентир) - {entry:.6f}\n"
-        f"Тейк - {take_profit:.6f}\n"
-        f"Стоп - {stop_loss:.6f}\n\n"
-        f"Таймфрейм: {timeframe} (MTF: {CONFIG['HTF_TIMEFRAME']})\n"
+        f"Leverage {leverage}х\n"
+        f"Entry (guide) - {entry:.6f}\n"
+        f"Take profit - {take_profit:.6f}\n"
+        f"Stop loss - {stop_loss:.6f}\n\n"
+        f"Timeframe: {timeframe} (MTF: {CONFIG['HTF_TIMEFRAME']})\n"
         f"EMA200: {ema200:.5f}\n"
         f"RSI(14): {rsi:.1f}\n"
         f"ATR: {atr_pct:.2f}%\n"
         f"MACD: {macd:.5f}\n"
         f"StochRSI: {stoch_rsi:.1f}\n"
-        f"Импульсная свеча (UTC): {impulse_str}\n\n"
-        "Логика: импульсная свеча, стоп за экстремумом, тейк по RR "
-        f"{CONFIG['RISK_REWARD']}, фильтр по тренду, ATR, BTC и осцилляторам."
+        f"Impulse candle (UTC): {impulse_str}\n\n"
+        "Logic: impulse candle, stop behind the extreme, take profit by RR "
+        f"{CONFIG['RISK_REWARD']}, trend filter, ATR, BTC и осцилляторам."
     )
 
 
@@ -1094,7 +1094,7 @@ def analyse_symbol(
     impulse_high = h5[impulse_idx]
     impulse_time = datetime.fromtimestamp(t5[impulse_idx] / 1000, timezone.utc)
 
-    # ✅ ПАТЧ №2: Стоп считать ТОЛЬКО по закрытым свечам
+    # ✅ ПАТЧ №2: Stop loss считать ТОЛЬКО по закрытым свечам
     # Берём swing за последние 4 закрытые свечи (исключая текущую "живую")
     swing_lookback = 4
     swing_low = min(l5[-(swing_lookback + 1):-1])
@@ -1206,7 +1206,7 @@ def scan_market_and_send_signals() -> int:
     btc_ctx = get_btc_context()
     symbols = get_usdt_perp_symbols()
     symbols = get_24h_volume_filter(symbols)
-    logging.info("Анализ %d символов...", len(symbols))
+    logging.info("Analysing %d символов...", len(symbols))
 
     # 1. Собираем ВСЕ кандидатов
     candidates: List[Dict[str, Any]] = []
@@ -1231,7 +1231,7 @@ def scan_market_and_send_signals() -> int:
     # 3. ✅ Берём ТОЛЬКО 1 лучший (MAX_SIGNALS_PER_SCAN = 1)
     best_candidate = candidates[0]
     
-    logging.info("Найдено кандидатов: %d. Лучший: %s %s (score: %.2f, ATR: %.2f%%, тейк: %.2f%%)",
+    logging.info("Found кандидатов: %d. Лучший: %s %s (score: %.2f, ATR: %.2f%%, тейк: %.2f%%)",
                  len(candidates),
                  best_candidate["symbol"],
                  best_candidate["side"],
@@ -1280,7 +1280,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     first_token = (text_in.split()[:1] or [""])[0].lower()
 
     # ===== Пользовательские команды =====
-    if first_token in ("/start",) or lower in ("старт", "🚀 старт"):
+    if first_token in ("/start",) or lower in ("start", "🚀 start", "старт", "🚀 старт"):
         db_add_or_update_subscriber(chat_id, is_admin=is_admin)
         send_telegram_message(
             "✅ Подписка включена. Буду присылать сигналы, когда появятся условия.",
@@ -1290,28 +1290,28 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    if first_token in ("/stop",) or lower in ("стоп", "🔴 стоп"):
+    if first_token in ("/stop",) or lower in ("stop", "🔴 stop", "стоп", "🔴 стоп"):
         db_unsubscribe(chat_id)
         send_telegram_message(
-            "🔴 Подписка выключена. Если передумаете — нажмите 🚀 Старт.",
+            "🔴 Подписка выключена. Если передумаете — нажмите 🚀 Start.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/help",) or lower in ("помощь", "ℹ️ помощь"):
+    if first_token in ("/help",) or lower in ("help", "ℹ️ help", "помощь", "ℹ️ помощь"):
         help_text = (
-            "<b>ℹ️ Помощь</b>\n\n"
+            "<b>ℹ️ Help</b>\n\n"
             "• 🚀 <b>Старт</b> — подписаться на сигналы\n"
-            "• 🔴 <b>Стоп</b> — отписаться\n"
+            "• 🔴 <b>Stop loss</b> — отписаться\n"
             "• 📊 <b>Статус</b> — параметры/режимы бота\n\n"
             "Если вы админ — появятся дополнительные кнопки."
         )
         send_telegram_message(help_text, chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    if first_token in ("/id",) or lower in ("мой id", "🆔 мой id", "id"):
+    if first_token in ("/id",) or lower in ("my id", "🆔 my id", "id", "мой id", "🆔 мой id"):
         send_telegram_message(
             f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
             chat_id=chat_id,
@@ -1320,10 +1320,10 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    if first_token in ("/status",) or lower in ("статус", "📊 статус"):
+    if first_token in ("/status",) or lower in ("status", "📊 status", "статус", "📊 статус"):
         risk_off_state = "активен" if (STATE and STATE.is_risk_off()) else "выключен"
         msg_lines = [
-            "<b>📊 Статус торгового бота</b>",
+            "<b>📊 Status торгового бота</b>",
             "",
             f"⏱ Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек",
             f"🎯 Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
@@ -1350,9 +1350,9 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    if first_token in ("/admin",) or lower in ("админ", "🛠 админ"):
+    if first_token in ("/admin",) or lower in ("admin", "🛠 admin", "админ", "🛠 админ"):
         msg_admin = (
-            "<b>🛠 Админ-панель</b>\n\n"
+            "<b>🛠 Admin-панель</b>\n\n"
             f"👥 Подписчиков: {db_get_subscribers_count()}\n"
             f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
             f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
@@ -1376,23 +1376,23 @@ def handle_command(update: Dict[str, Any]) -> None:
 
     if first_token in ("/risk_off",) or lower in ("🛑 risk off", "risk off"):
         STATE.set_risk_off(True)
-        send_telegram_message("🛑 Режим <b>Risk OFF</b> включён. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
+        send_telegram_message("🛑 <b>Risk OFF</b> enabled. Market scanning paused.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
     if first_token in ("/risk_on",) or lower in ("✅ risk on", "risk on"):
         STATE.set_risk_off(False)
-        send_telegram_message("✅ Режим <b>Risk OFF</b> выключен. Сканирование включено.", chat_id=chat_id, html=True, reply_markup=kb)
+        send_telegram_message("✅ <b>Risk OFF</b> disabled. Market scanning resumed.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    if first_token in ("/scan",) or lower in ("🧪 тест-скан", "тест-скан", "тест скан"):
-        send_telegram_message("🧪 Тест-скан запущен…\n⏳ Это может занять 10—60 секунд.", chat_id=chat_id, html=False, reply_markup=kb)
+    if first_token in ("/scan",) or lower in ("🧪 test scan", "test scan", "test-scan", "scan test", "🧪 тест-скан", "тест-скан", "тест скан"):
+        send_telegram_message("🧪 Test scan started…\n⏳ This may take 10—60 seconds.", chat_id=chat_id, html=False, reply_markup=kb)
 
         def _run_scan_async(admin_chat_id: str) -> None:
             try:
                 sent = scan_market_and_send_signals()
-                send_telegram_message(f"✅ 🧪 Тест-скан завершён. Отправлено сигналов: {sent}", chat_id=admin_chat_id, html=False, reply_markup=kb)
+                send_telegram_message(f"✅ 🧪 Test scan finished. Signals sent: {sent}", chat_id=admin_chat_id, html=False, reply_markup=kb)
             except Exception as e:
-                send_telegram_message(f"❌ Ошибка тест-скана: {e}", chat_id=admin_chat_id, html=False, reply_markup=kb)
+                send_telegram_message(f"❌ Test scan error: {e}", chat_id=admin_chat_id, html=False, reply_markup=kb)
 
         threading.Thread(target=_run_scan_async, args=(chat_id,), daemon=True).start()
         return
@@ -1421,7 +1421,7 @@ def telegram_polling_loop() -> None:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logging.error("Ошибка получения обновлений: %s", e)
+            logging.error("Error fetching updates: %s", e)
             time.sleep(5)
             continue
         if not data.get("ok"):
@@ -1457,7 +1457,7 @@ def main_loop() -> None:
     logging.info("=" * 60)
     logging.info("Конфигурация:")
     logging.info("  - Минимальный объём: %s USDT", f"{CONFIG['MIN_QUOTE_VOLUME']:,}")
-    logging.info("  - Таймфрейм: %s + %s", CONFIG["TIMEFRAME"], CONFIG["HTF_TIMEFRAME"])
+    logging.info("  - Timeframe: %s + %s", CONFIG["TIMEFRAME"], CONFIG["HTF_TIMEFRAME"])
     logging.info("  - Интервал сканирования: %d сек", CONFIG["SCAN_INTERVAL_SECONDS"])
     logging.info("  - Лимит сигналов в день: %d", CONFIG["MAX_SIGNALS_PER_DAY"])
     logging.info("  - Лимит сигналов в час: %d", CONFIG["MAX_SIGNALS_PER_HOUR"])
@@ -1472,7 +1472,7 @@ def main_loop() -> None:
     last_scan_ts = 0.0
 
     def handle_sigterm(signum, frame):
-        logging.info("Получен сигнал остановки. Завершение работы...")
+        logging.info("Stop signal received. Shutting down...")
         raise SystemExit
 
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -1491,11 +1491,11 @@ def main_loop() -> None:
         
         # Сканируем рынок по расписанию
         if now - last_scan_ts >= CONFIG["SCAN_INTERVAL_SECONDS"]:
-            logging.info("Начало сканирования рынка...")
+            logging.info("Market scan started...")
             try:
                 scan_market_and_send_signals()
             except Exception as e:
-                logging.error("Ошибка при сканировании рынка: %s", e)
+                logging.error("Market scan error: %s", e)
             last_scan_ts = time.time()
         
         time.sleep(1)
@@ -1505,6 +1505,6 @@ if __name__ == "__main__":
     try:
         main_loop()
     except SystemExit:
-        logging.info("Бот остановлен.")
+        logging.info("Bot stopped.")
     except Exception as e:
-        logging.error("Критическая ошибка: %s", e)
+        logging.error("Critical error: %s", e)
