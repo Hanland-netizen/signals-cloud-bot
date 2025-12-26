@@ -28,11 +28,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 FOMC_DATES_UTC: List[datetime] = []
 
-# Кэш параметров символов (tickSize/stepSize) из exchangeInfo
-SYMBOL_TICK_SIZE: Dict[str, float] = {}
-SYMBOL_STEP_SIZE: Dict[str, float] = {}
-
-
 CONFIG: Dict[str, Any] = {
     "TIMEFRAME": "5m",
     "HTF_TIMEFRAME": "15m",
@@ -43,8 +38,6 @@ CONFIG: Dict[str, Any] = {
     "MIN_SEND_GAP_SECONDS": 1800,  # 30 минут между отправками
     "MIN_QUOTE_VOLUME": 40_000_000,  # 40M USDT
     "RISK_REWARD": 1.7,
-    "LEVERAGE": 15,  # стандартное плечо для сигналов
-
     "MIN_ATR_PCT": 0.45,  # Убираем микроскальпы
     "MAX_ATR_PCT": 5.0,
     "MIN_STOP_PCT": 0.30,  # Стоп не слишком близко
@@ -148,13 +141,18 @@ LAST_SEND_TS: float = 0.0
 
 
 def normalize_command(text: str) -> str:
-    """Нормализует команду: убирает эмодзи/пробелы и (если есть) берёт часть до '/'."""
-    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text)
+    """Normalise a button/command text: remove leading emoji, trim, and
+    (for bilingual buttons) keep the left side before '/'.
+
+    Note: trading logic is untouched — this only affects Telegram UI/commands.
+    """
+    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text or '')
     text = text.strip()
-    # For buttons like "Status / Статус" or "Help / Помощь" — take the left part
+    # Bilingual buttons like "Start / Старт" → keep "Start"
     if "/" in text:
         text = text.split("/", 1)[0].strip()
     return text
+
 
 
 def enqueue_signal(signal_data: Dict[str, Any]) -> None:
@@ -461,7 +459,7 @@ def admin_stats_text(days: int = 7) -> str:
         f"{top_text}\n\n"
         "<b>Последний сигнал:</b>\n"
         f"{last_line}\n\n"
-        f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}"
+        f"🕒 Updated / Обновлено: {datetime.now().strftime('%H:%M:%S')}"
     )
 
 
@@ -522,14 +520,14 @@ def get_reply_keyboard(chat_id: str) -> Dict[str, Any]:
     is_admin = (str(chat_id) == TG_ADMIN_ID) if TG_ADMIN_ID else False
 
     rows = [
-        [{"text": "🚀 Старт"}, {"text": "📊 Статус"}],
-        [{"text": "ℹ️ Помощь"}, {"text": "🔴 Стоп"}],
-        [{"text": "🆔 Мой ID"}],
+        [{"text": "🚀 Start / Старт"}, {"text": "📊 Status / Статус"}],
+        [{"text": "ℹ️ Help / Помощь"}, {"text": "🔴 Stop / Стоп"}],
+        [{"text": "🆔 My ID / Мой ID"}],
     ]
     if is_admin:
-        rows.append([{"text": "🛠 Админ"}, {"text": "⚙️ Настройки"}])
+        rows.append([{"text": "🛠 Admin / Админ"}, {"text": "⚙️ Settings / Настройки"}])
         rows.append([{"text": "🛑 Risk OFF"}, {"text": "✅ Risk ON"}])
-        rows.append([{"text": "🧪 Тест-скан"}, {"text": "📈 Статистика"}])
+        rows.append([{"text": "🧪 Test scan / Тест-скан"}, {"text": "📈 Stats / Статистика"}])
 
     return {
         "keyboard": rows,
@@ -558,84 +556,12 @@ def fetch_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     raise RuntimeError(f"Не удалось получить данные с Binance: {path}")
 
 
-def _get_tick_size(symbol: str) -> float:
-    """Получить tickSize из кэша, при необходимости обновить exchangeInfo."""
-    ts = SYMBOL_TICK_SIZE.get(symbol)
-    if ts and ts > 0:
-        return ts
-    # fallback: обновим кэш один раз
-    try:
-        data = fetch_binance("/fapi/v1/exchangeInfo")
-        for s in data.get("symbols", []):
-            sym = s.get("symbol")
-            if not sym:
-                continue
-            try:
-                for f in s.get("filters", []):
-                    if f.get("filterType") == "PRICE_FILTER":
-                        SYMBOL_TICK_SIZE[sym] = float(f.get("tickSize", 0.0))
-                    elif f.get("filterType") == "LOT_SIZE":
-                        SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
-            except Exception:
-                continue
-        ts = SYMBOL_TICK_SIZE.get(symbol)
-        return ts if ts and ts > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def round_price_to_tick(symbol: str, price: float) -> float:
-    """Округляет цену к шагу цены (tickSize) Binance Futures."""
-    tick = _get_tick_size(symbol)
-    if not tick or tick <= 0:
-        # безопасный fallback: 1e-6
-        return round(price, 6)
-    # округление вниз к тик-спейсу (чтобы лимит/стоп не ушли за шаг)
-    steps = math.floor(price / tick)
-    rounded = steps * tick
-    # устранение плавающей ошибки
-    prec = max(0, int(round(-math.log10(tick), 0))) if tick < 1 else 0
-    return float(f"{rounded:.{prec}f}")
-
-
-def _fix_prices_for_side(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float) -> Tuple[float, float, float]:
-    """Гарантирует корректный порядок цен после округлений."""
-    entry_r = round_price_to_tick(symbol, entry)
-    sl_r = round_price_to_tick(symbol, stop_loss)
-    tp_r = round_price_to_tick(symbol, take_profit)
-
-    if side == "long":
-        # должно быть: SL < ENTRY < TP
-        if sl_r >= entry_r:
-            sl_r = round_price_to_tick(symbol, entry_r * (1.0 - 0.001))  # -0.1% fallback
-        if tp_r <= entry_r:
-            tp_r = round_price_to_tick(symbol, entry_r * (1.0 + 0.0017))  # +0.17% fallback
-    else:
-        # short: TP < ENTRY < SL
-        if sl_r <= entry_r:
-            sl_r = round_price_to_tick(symbol, entry_r * (1.0 + 0.001))  # +0.1% fallback
-        if tp_r >= entry_r:
-            tp_r = round_price_to_tick(symbol, entry_r * (1.0 - 0.0017))  # -0.17% fallback
-
-    return entry_r, sl_r, tp_r
-
-
 def get_usdt_perp_symbols() -> List[str]:
     data = fetch_binance("/fapi/v1/exchangeInfo")
     symbols = []
     for s in data.get("symbols", []):
         if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT":
-            sym = s["symbol"]
-            symbols.append(sym)
-            # Сохраняем параметры цены/кол-ва для корректного округления
-            try:
-                for f in s.get("filters", []):
-                    if f.get("filterType") == "PRICE_FILTER":
-                        SYMBOL_TICK_SIZE[sym] = float(f.get("tickSize", 0.0))
-                    elif f.get("filterType") == "LOT_SIZE":
-                        SYMBOL_STEP_SIZE[sym] = float(f.get("stepSize", 0.0))
-            except Exception:
-                pass
+            symbols.append(s["symbol"])
     logging.info("Найдено %d USDT-M PERPETUAL символов", len(symbols))
     return symbols
 
@@ -1110,10 +1036,6 @@ def analyse_symbol(
 
     if side == "long":
         stop_loss = swing_low * (1.0 - buf_long)
-        # ✅ НОВОЕ: стоп не должен быть слишком близко к входу относительно ATR
-        min_stop_abs = atr_abs * float(CONFIG.get("MIN_STOP_ATR_MULT", 0.60))
-        if (close - stop_loss) < min_stop_abs:
-            stop_loss = close - min_stop_abs
         # Защита: стоп не может быть выше или равен входу
         if stop_loss >= close:
             if CONFIG.get("DEBUG_REASONS"):
@@ -1133,10 +1055,6 @@ def analyse_symbol(
         tp_pct = abs((take_profit - close) / close) * 100.0
     else:  # short
         stop_loss = swing_high * (1.0 + buf_short)
-        # ✅ НОВОЕ: стоп не должен быть слишком близко к входу относительно ATR
-        min_stop_abs = atr_abs * float(CONFIG.get("MIN_STOP_ATR_MULT", 0.60))
-        if (stop_loss - close) < min_stop_abs:
-            stop_loss = close + min_stop_abs
         # Защита: стоп не может быть ниже или равен входу
         if stop_loss <= close:
             if CONFIG.get("DEBUG_REASONS"):
@@ -1154,7 +1072,9 @@ def analyse_symbol(
         
         take_profit = close - (stop_loss - close) * CONFIG["RISK_REWARD"] * tp_extra
         tp_pct = abs((close - take_profit) / close) * 100.0
-    leverage = int(CONFIG.get("LEVERAGE", 15))
+
+    leverage = 20
+
     # ✅ QUALITY: Фильтр минимального тейка (главный против скальпов)
     if tp_pct < CONFIG["MIN_TP_PCT"]:
         if CONFIG.get("DEBUG_REASONS"):
@@ -1174,16 +1094,13 @@ def analyse_symbol(
     distance_from_ema_pct = abs((close - ema) / ema) * 100.0
     score = (atr_pct * 10.0) + (abs(macd_val) * 2.0) + (distance_from_ema_pct * 100.0)
 
-    # ✅ Округляем entry/SL/TP к tickSize Binance и страхуем порядок цен
-    entry_r, stop_r, tp_r = _fix_prices_for_side(symbol, side, close, stop_loss, take_profit)
-
     return {
         "symbol": symbol,
         "side": side,
         "leverage": leverage,
-        "entry": entry_r,
-        "take_profit": tp_r,
-        "stop_loss": stop_r,
+        "entry": close,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
         "ema200": ema,
         "rsi": rsi,
         "impulse_time": impulse_time,
@@ -1284,7 +1201,7 @@ def handle_command(update: Dict[str, Any]) -> None:
     first_token = (text_in.split()[:1] or [""])[0].lower()
 
     # ===== Пользовательские команды =====
-    if first_token in ("/start",) or lower in ("старт", "🚀 старт", "start", "🚀 start"):
+    if first_token in ("/start",) or lower in ("старт", "start", "🚀", "🚀 старт", "🚀 start"):
         db_add_or_update_subscriber(chat_id, is_admin=is_admin)
         send_telegram_message(
             "✅ Подписка включена. Буду присылать сигналы, когда появятся условия.",
@@ -1294,19 +1211,19 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    if first_token in ("/stop",) or lower in ("стоп", "🔴 стоп", "stop", "🔴 stop"):
+    if first_token in ("/stop",) or lower in ("стоп", "stop", "🔴", "🔴 стоп", "🔴 stop"):
         db_unsubscribe(chat_id)
         send_telegram_message(
-            "🔴 Подписка выключена. Если передумаете — нажмите 🚀 Старт.",
+            "🔴 Подписка disabled / выключена. Если передумаете — нажмите 🚀 Старт.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/help",) or lower in ("помощь", "ℹ️ помощь", "help", "ℹ️ help"):
+    if first_token in ("/help",) or lower in ("помощь", "help", "ℹ️", "ℹ️ помощь", "ℹ️ help", "/help"):
         help_text = (
-            "<b>ℹ️ Помощь</b>\n\n"
+            "<b>ℹ️ Help / Помощь</b>\n\n"
             "• 🚀 <b>Старт</b> — подписаться на сигналы\n"
             "• 🔴 <b>Стоп</b> — отписаться\n"
             "• 📊 <b>Статус</b> — параметры/режимы бота\n\n"
@@ -1315,74 +1232,75 @@ def handle_command(update: Dict[str, Any]) -> None:
         send_telegram_message(help_text, chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    if first_token in ("/id",) or lower in ("мой id", "🆔 мой id", "id", "my id", "🆔 my id"):
+    if first_token in ("/id",) or lower in ("мой id", "my id", "id", "🆔", "🆔 мой id", "🆔 my id"):
         send_telegram_message(
-            f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
+            f"🆔 Your Telegram ID / Ваш Telegram ID: <code>{user_id}</code>",
             chat_id=chat_id,
             html=True,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/status",) or lower in ("статус", "📊 статус", "status", "📊 status"):
-        risk_off_state = "активен" if (STATE and STATE.is_risk_off()) else "выключен"
+    if first_token in ("/status",) or lower in ("статус", "status", "📊", "📊 статус", "📊 status"):
+        risk_off_state = "ON / активен" if (STATE and STATE.is_risk_off()) else "disabled / выключен"
         msg_lines = [
-            "<b>📊 Статус торгового бота</b>",
+            "<b>📊 Bot status / Статус торгового бота</b>",
             "",
-            f"⏱ Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек",
-            f"🎯 Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
-            f"📈 Multi-TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
-            f"💹 Фильтр BTC: {'включён' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}",
-            f"🔥 ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
-            f"💰 Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
+            f"⏱ Scan interval / Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек",
+            f"🎯 Daily signal limit / Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
+            f"📈 Multi‑TF analysis / Multi‑TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
+            f"💹 BTC filter / Фильтр BTC: {'enabled / включён' if CONFIG['BTC_FILTER_ENABLED'] else 'disabled / выключен'}",
+            f"🔥 ATR filter / ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
+            f"💰 Min 24h volume / Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             f"🛑 Risk OFF: {risk_off_state}",
         ]
         if is_admin:
-            msg_lines.append(f"👥 Подписчиков: {db_get_subscribers_count()}")
+            msg_lines.append(f"👥 Subscribers / Подписчиков: {db_get_subscribers_count()}")
         msg_lines.append("")
-        msg_lines.append(f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}")
+        msg_lines.append(f"🕒 Updated / Обновлено: {datetime.now().strftime('%H:%M:%S')}")
         send_telegram_message("\n".join(msg_lines), chat_id=chat_id, html=True, reply_markup=kb)
         return
 
     # ===== Админские команды =====
     if not is_admin:
         send_telegram_message(
-            "Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
+            "I don't recognise that command yet. / Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/admin",) or lower in ("админ", "🛠 админ", "admin", "🛠 admin"):
+    if first_token in ("/admin",) or lower in ("админ", "admin", "🛠", "🛠 админ", "🛠 admin"):
         msg_admin = (
-            "<b>🛠 Админ-панель</b>\n\n"
-            f"👥 Подписчиков: {db_get_subscribers_count()}\n"
+            "<b>🛠 Admin panel / Админ-панель</b>\n\n"
+            f"👥 Subscribers / Подписчиков: {db_get_subscribers_count()}\n"
             f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
             f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
-            f"💹 BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}\n"
+            f"💹 BTC filter / BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}\n"
             f"🔥 ATR min/max: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%\n\n"
-            "Используйте кнопки админа ниже 👇"
+            "Use the admin buttons below 👇 / Используйте кнопки админа ниже 👇"
         )
         send_telegram_message(msg_admin, chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-
-    if lower in ("настройки", "⚙️ настройки", "settings", "⚙️ settings"):
+    # Settings (UI only)
+    if first_token in ("/settings",) or lower in ("настройки", "settings", "⚙️", "⚙️ настройки", "⚙️ settings"):
         msg_settings = (
             "<b>⚙️ Settings / Настройки</b>\n\n"
-            "Most parameters are configured via environment variables (.env on local / Variables on Railway).\n"
-            "Основные параметры настраиваются через переменные окружения (.env локально / Variables на Railway).\n\n"
-            f"• Scan interval / Интервал: {CONFIG.get('SCAN_INTERVAL_SECONDS')} sec\n"
-            f"• Min 24h volume / Мин. объём: {CONFIG.get('MIN_24H_VOLUME_USDT'):,} USDT\n"
-            f"• Leverage / Плечо: {CONFIG.get('LEVERAGE')}x\n"
-            f"• RR: {CONFIG.get('RISK_REWARD')}\n"
-            f"• Timeframes: {CONFIG.get('TIMEFRAME')} + {CONFIG.get('HTF_TIMEFRAME')}\n"
+            f"⏱ Scan interval: {CONFIG['SCAN_INTERVAL_SEC']} sec / Интервал сканирования: {CONFIG['SCAN_INTERVAL_SEC']} сек\n"
+            f"💰 Min 24h volume: {CONFIG['MIN_24H_VOLUME_USDT']:,} USDT / Мин. объём за 24ч: {CONFIG['MIN_24H_VOLUME_USDT']:,} USDT\n"
+            f"🔥 ATR filter: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}% / ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%\n"
+            f"🎯 Daily limit: {CONFIG['MAX_SIGNALS_PER_DAY']} / Лимит в день: {CONFIG['MAX_SIGNALS_PER_DAY']}\n"
+            f"📈 Hourly limit: {CONFIG['MAX_SIGNALS_PER_HOUR']} / Лимит в час: {CONFIG['MAX_SIGNALS_PER_HOUR']}\n"
+            f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'} / Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
+            "\nTo change settings, edit CONFIG in the code or environment variables (if used). / Чтобы изменить настройки, правьте CONFIG в коде или переменные окружения (если используются)."
         )
         send_telegram_message(msg_settings, chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    if first_token in ("/stats",) or lower.startswith("📈 статистика") or lower.startswith("статистика") or lower.startswith("📈 stats") or lower.startswith("stats"):
+
+    if first_token in ("/stats",) or lower in ("статистика", "stats", "statistics", "📈", "📈 статистика", "📈 stats"):
         days = 7
         parts = text_in.split()
         if len(parts) >= 2:
@@ -1395,15 +1313,15 @@ def handle_command(update: Dict[str, Any]) -> None:
 
     if first_token in ("/risk_off",) or lower in ("🛑 risk off", "risk off"):
         STATE.set_risk_off(True)
-        send_telegram_message("🛑 Режим <b>Risk OFF</b> включён. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
+        send_telegram_message("🛑 <b>Risk OFF</b> enabled. Scanning paused. / 🛑 Режим <b>Risk OFF</b> включен. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
     if first_token in ("/risk_on",) or lower in ("✅ risk on", "risk on"):
         STATE.set_risk_off(False)
-        send_telegram_message("✅ Режим <b>Risk OFF</b> выключен. Сканирование включено.", chat_id=chat_id, html=True, reply_markup=kb)
+        send_telegram_message("🛑 <b>Risk OFF</b> enabled. Scanning paused. / 🛑 Режим <b>Risk OFF</b> включен. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    if first_token in ("/scan",) or lower in ("🧪 тест-скан", "тест-скан", "тест скан", "🧪 test scan", "test scan", "test-scan"):
+    if first_token in ("/scan",) or lower in ("🧪 тест-скан", "тест-скан", "тест скан"):
         send_telegram_message("🧪 Тест-скан запущен…\n⏳ Это может занять 10—60 секунд.", chat_id=chat_id, html=False, reply_markup=kb)
 
         def _run_scan_async(admin_chat_id: str) -> None:
@@ -1417,7 +1335,7 @@ def handle_command(update: Dict[str, Any]) -> None:
         return
 
     send_telegram_message(
-        "Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
+        "I don't recognise that command yet. / Я пока не понимаю эту команду.\nИспользуйте кнопки под полем ввода или /help.",
         chat_id=chat_id,
         html=False,
         reply_markup=kb,
@@ -1457,8 +1375,8 @@ def telegram_polling_loop() -> None:
             else:
                 chat_id = str(msg.get("chat", {}).get("id"))
                 send_telegram_message(
-                    "Я пока не понимаю эту команду.\n"
-                    "Пожалуйста, используйте кнопки под полем ввода или /help.",
+                    "I don't recognise that command yet. / Я пока не понимаю эту команду.\n"
+                    "Please use the buttons below or type /help. / Используйте кнопки под полем ввода или /help.",
                     chat_id=chat_id,
                     html=False,
                     reply_markup=get_reply_keyboard(chat_id),
