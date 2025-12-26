@@ -141,18 +141,9 @@ LAST_SEND_TS: float = 0.0
 
 
 def normalize_command(text: str) -> str:
-    """Normalise a button/command text: remove leading emoji, trim, and
-    (for bilingual buttons) keep the left side before '/'.
-
-    Note: trading logic is untouched — this only affects Telegram UI/commands.
-    """
-    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text or '')
-    text = text.strip()
-    # Bilingual buttons like "Start / Старт" → keep "Start"
-    if "/" in text:
-        text = text.split("/", 1)[0].strip()
-    return text
-
+    """Нормализует команду, убирая эмодзи и лишние пробелы."""
+    text = re.sub(r'^[\U0001F300-\U0001F9FF\u2600-\u26FF\u2700-\u27BF]+\s*', '', text)
+    return text.strip()
 
 
 def enqueue_signal(signal_data: Dict[str, Any]) -> None:
@@ -521,7 +512,7 @@ def get_reply_keyboard(chat_id: str) -> Dict[str, Any]:
 
     rows = [
         [{"text": "🚀 Start / Старт"}, {"text": "📊 Status / Статус"}],
-        [{"text": "ℹ️ Help / Помощь"}, {"text": "🔴 Stop / Стоп"}],
+        [{"text": "ℹ️ Help / Помощь"}, {"text": "🔴 Стоп"}],
         [{"text": "🆔 My ID / Мой ID"}],
     ]
     if is_admin:
@@ -1201,56 +1192,72 @@ def handle_command(update: Dict[str, Any]) -> None:
     first_token = (text_in.split()[:1] or [""])[0].lower()
 
     # ===== Пользовательские команды =====
-    if first_token in ("/start",) or lower in ("старт", "start", "🚀", "🚀 старт", "🚀 start"):
+    if first_token in ("/start",) or ("старт" in lower) or lower.startswith("start"):
         db_add_or_update_subscriber(chat_id, is_admin=is_admin)
         send_telegram_message(
-            "✅ Подписка включена. Буду присылать сигналы, когда появятся условия.",
+            "✅ Subscription enabled. I will send signals when conditions appear. / ✅ Подписка включена. Буду присылать сигналы, когда появятся условия.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/stop",) or lower in ("стоп", "stop", "🔴", "🔴 стоп", "🔴 stop"):
+    if first_token in ("/stop",) or ("стоп" in lower) or lower.startswith("stop"):
         db_unsubscribe(chat_id)
         send_telegram_message(
-            "🔴 Подписка disabled / выключена. Если передумаете — нажмите 🚀 Старт.",
+            "🔴 Subscription disabled. If you change your mind, press 🚀 Start. / 🔴 Подписка выключена. Если передумаете — нажмите 🚀 Старт.",
             chat_id=chat_id,
             html=False,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/help",) or lower in ("помощь", "help", "ℹ️", "ℹ️ помощь", "ℹ️ help", "/help"):
+    if first_token in ("/help",) or ("помощ" in lower) or lower.startswith("help"):
         help_text = (
-            "<b>ℹ️ Help / Помощь</b>\n\n"
-            "• 🚀 <b>Старт</b> — подписаться на сигналы\n"
-            "• 🔴 <b>Стоп</b> — отписаться\n"
-            "• 📊 <b>Статус</b> — параметры/режимы бота\n\n"
-            "Если вы админ — появятся дополнительные кнопки."
-        )
-        send_telegram_message(help_text, chat_id=chat_id, html=True, reply_markup=kb)
-        return
+        "<b>ℹ️ Help / Помощь</b>
 
-    if first_token in ("/id",) or lower in ("мой id", "my id", "id", "🆔", "🆔 мой id", "🆔 my id"):
+"
+        "🚀 <b>Start / Старт</b> — subscribe to signals / подписаться на сигналы
+"
+        "🛑 <b>Stop / Стоп</b> — unsubscribe / отписаться
+"
+        "📊 <b>Status / Статус</b> — bot settings & modes / параметры и режимы бота
+"
+        "📈 <b>Stats / Статистика</b> — basic statistics / статистика
+"
+        "🆔 <b>My ID / Мой ID</b> — show your Telegram ID / показать ваш Telegram ID
+"
+        "🛠 <b>Admin / Админ</b> — admin panel (admins only) / админ‑панель (только для админов)
+"
+        "⚙️ <b>Settings / Настройки</b> — quick settings (if enabled) / быстрые настройки (если включены)
+
+"
+        "If you are an admin, extra buttons will appear.
+"
+        "Если вы админ — появятся дополнительные кнопки."
+    )
+    send_telegram_message(chat_id, help_text, parse_mode="HTML")
+    return
+
+    if first_token in ("/id",) or lower in ("мой id", "🆔 мой id", "id"):
         send_telegram_message(
-            f"🆔 Your Telegram ID / Ваш Telegram ID: <code>{user_id}</code>",
+            f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
             chat_id=chat_id,
             html=True,
             reply_markup=kb,
         )
         return
 
-    if first_token in ("/status",) or lower in ("статус", "status", "📊", "📊 статус", "📊 status"):
-        risk_off_state = "ON / активен" if (STATE and STATE.is_risk_off()) else "disabled / выключен"
+    if first_token in ("/status",) or ("статус" in lower) or lower.startswith("status"):
+        risk_off_state = "активен" if (STATE and STATE.is_risk_off()) else "выключен"
         msg_lines = [
             "<b>📊 Bot status / Статус торгового бота</b>",
             "",
             f"⏱ Scan interval / Интервал сканирования: {CONFIG['SCAN_INTERVAL_SECONDS']} сек",
             f"🎯 Daily signal limit / Лимит сигналов в день: {CONFIG['MAX_SIGNALS_PER_DAY']}",
             f"📈 Multi‑TF analysis / Multi‑TF анализ: {CONFIG['TIMEFRAME']} + {CONFIG['HTF_TIMEFRAME']}",
-            f"💹 BTC filter / Фильтр BTC: {'enabled / включён' if CONFIG['BTC_FILTER_ENABLED'] else 'disabled / выключен'}",
-            f"🔥 ATR filter / ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
+            f"💹 BTC filter / Фильтр BTC: {'включён' if CONFIG['BTC_FILTER_ENABLED'] else 'выключен'}",
+            f"🔥 ATR filter / ATR‑фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%",
             f"💰 Min 24h volume / Мин. объём за 24ч: {CONFIG['MIN_QUOTE_VOLUME']:,} USDT",
             f"🛑 Risk OFF: {risk_off_state}",
         ]
@@ -1271,11 +1278,11 @@ def handle_command(update: Dict[str, Any]) -> None:
         )
         return
 
-    if first_token in ("/admin",) or lower in ("админ", "admin", "🛠", "🛠 админ", "🛠 admin"):
+    if first_token in ("/admin",) or lower in ("админ", "🛠 админ"):
         msg_admin = (
-            "<b>🛠 Admin panel / Админ-панель</b>\n\n"
+            "<b>🛠 Admin panel / Админ‑панель</b>\n\n"
             f"👥 Subscribers / Подписчиков: {db_get_subscribers_count()}\n"
-            f"📌 Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
+            f"📌 Signals today / Сигналы сегодня: {STATE.signals_sent_today}/{CONFIG['MAX_SIGNALS_PER_DAY']}\n"
             f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
             f"💹 BTC filter / BTC фильтр: {'ON' if CONFIG['BTC_FILTER_ENABLED'] else 'OFF'}\n"
             f"🔥 ATR min/max: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%\n\n"
@@ -1284,23 +1291,7 @@ def handle_command(update: Dict[str, Any]) -> None:
         send_telegram_message(msg_admin, chat_id=chat_id, html=True, reply_markup=kb)
         return
 
-    # Settings (UI only)
-    if first_token in ("/settings",) or lower in ("настройки", "settings", "⚙️", "⚙️ настройки", "⚙️ settings"):
-        msg_settings = (
-            "<b>⚙️ Settings / Настройки</b>\n\n"
-            f"⏱ Scan interval: {CONFIG['SCAN_INTERVAL_SEC']} sec / Интервал сканирования: {CONFIG['SCAN_INTERVAL_SEC']} сек\n"
-            f"💰 Min 24h volume: {CONFIG['MIN_24H_VOLUME_USDT']:,} USDT / Мин. объём за 24ч: {CONFIG['MIN_24H_VOLUME_USDT']:,} USDT\n"
-            f"🔥 ATR filter: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}% / ATR-фильтр: {CONFIG['MIN_ATR_PCT']}—{CONFIG['MAX_ATR_PCT']}%\n"
-            f"🎯 Daily limit: {CONFIG['MAX_SIGNALS_PER_DAY']} / Лимит в день: {CONFIG['MAX_SIGNALS_PER_DAY']}\n"
-            f"📈 Hourly limit: {CONFIG['MAX_SIGNALS_PER_HOUR']} / Лимит в час: {CONFIG['MAX_SIGNALS_PER_HOUR']}\n"
-            f"🛑 Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'} / Risk OFF: {'ON' if STATE.is_risk_off() else 'OFF'}\n"
-            "\nTo change settings, edit CONFIG in the code or environment variables (if used). / Чтобы изменить настройки, правьте CONFIG в коде или переменные окружения (если используются)."
-        )
-        send_telegram_message(msg_settings, chat_id=chat_id, html=True, reply_markup=kb)
-        return
-
-
-    if first_token in ("/stats",) or lower in ("статистика", "stats", "statistics", "📈", "📈 статистика", "📈 stats"):
+    if first_token in ("/stats",) or lower.startswith("📈 статистика") or lower.startswith("статистика"):
         days = 7
         parts = text_in.split()
         if len(parts) >= 2:
@@ -1313,12 +1304,12 @@ def handle_command(update: Dict[str, Any]) -> None:
 
     if first_token in ("/risk_off",) or lower in ("🛑 risk off", "risk off"):
         STATE.set_risk_off(True)
-        send_telegram_message("🛑 <b>Risk OFF</b> enabled. Scanning paused. / 🛑 Режим <b>Risk OFF</b> включен. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
+        send_telegram_message("🛑 Режим <b>Risk OFF</b> включён. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
     if first_token in ("/risk_on",) or lower in ("✅ risk on", "risk on"):
         STATE.set_risk_off(False)
-        send_telegram_message("🛑 <b>Risk OFF</b> enabled. Scanning paused. / 🛑 Режим <b>Risk OFF</b> включен. Сканирование остановлено.", chat_id=chat_id, html=True, reply_markup=kb)
+        send_telegram_message("✅ Режим <b>Risk OFF</b> выключен. Сканирование включено.", chat_id=chat_id, html=True, reply_markup=kb)
         return
 
     if first_token in ("/scan",) or lower in ("🧪 тест-скан", "тест-скан", "тест скан"):
@@ -1370,7 +1361,7 @@ def telegram_polling_loop() -> None:
             if not msg:
                 continue
             text = msg.get("text", "") or ""
-            if text.startswith("/") or any(kw in text.lower() for kw in ["старт", "стоп", "помощь", "статус", "админ", "настройки", "risk", "тест-скан", "статистика", "мой id"]):
+            if text.startswith("/") or any(kw in text.lower() for kw in ["старт", "start", "стоп", "stop", "помощь", "help", "статус", "status", "админ", "admin", "настройки", "settings", "risk", "test scan", "тест-скан", "stats", "статистика", "мой id", "my id"]):
                 handle_command(upd)
             else:
                 chat_id = str(msg.get("chat", {}).get("id"))
