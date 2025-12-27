@@ -1377,7 +1377,7 @@ def handle_command(update: Dict[str, Any]) -> None:
         return
 
     if first_token in ("/scan",) or lower in ("🧪 test scan", "test scan", "test-scan", "🧪 тест-скан", "тест-скан", "тест скан"):
-        send_telegram_message("🧪 Test scan started…
+        send_telegram_message("🧪 Test scan started...
 ⏳ This may take 10–60 seconds.", chat_id=chat_id, html=False, reply_markup=kb)
 
         def _run_scan_async(admin_chat_id: str) -> None:
